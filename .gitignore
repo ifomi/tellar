@@ -1,0 +1,13 @@
+.venv/
+*.egg-info/
+__pycache__/
+*.pyc
+.DS_Store
+build/
+dist/
+build-cache/
+Tellar.app/Contents/Resources/python/
+Tellar.app/Contents/Resources/app/site-packages/
+Tellar.app/Contents/Resources/app/tellar/
+Tellar.app/Contents/_CodeSignature/
+Tellar.app/Contents/MacOS/tellar
