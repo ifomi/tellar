@@ -74,6 +74,19 @@ find "$SITE" -name "__pycache__" -type d -prune -exec rm -rf {} +
 find "$SITE" -name "*.pyc" -delete
 find "$SITE" -name "tests" -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
+# --- 6b. Prune unused transitive dependencies ---
+# mlx_whisper declares torch as a runtime dep, but the only file that imports
+# it (torch_whisper.py) is a reference implementation; mlx_whisper/__init__.py
+# does not pull it in, and our transcribe() path is pure-MLX. Removing torch
+# saves ~390 MB; sympy/networkx are torch-only deps and follow it out.
+# torchgen / functorch are torch's own subpackages installed separately.
+echo "==> Pruning unused transitive deps (torch family)"
+for pkg in torch torchgen functorch sympy networkx; do
+    find "$SITE" -maxdepth 1 \
+        \( -name "$pkg" -o -name "${pkg}-*.dist-info" \) \
+        -exec rm -rf {} + 2>/dev/null || true
+done
+
 # --- 7. Compile native launcher ---
 # launcher.c embeds CPython via Py_Initialize() so the binary at MacOS/tellar
 # is the actual process — not a bash script that exec()s python3.12. This is
