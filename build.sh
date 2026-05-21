@@ -79,6 +79,15 @@ echo "==> Installing pip dependencies into $SITE"
     "pyaudio>=0.2" \
     "numpy>=1.24"
 
+# --- 5b. Patch mlx_whisper for lazy timing import ---
+# transcribe.py eagerly imports .timing at module load, which pulls in scipy
+# and numba (and through numba, llvmlite — ~190 MB combined). add_word_timestamps
+# is the only consumer and runs only when word_timestamps=True; we never set
+# that flag. Move the import inside the conditional so timing.py is loaded
+# lazily — then we can drop scipy/numba/llvmlite below.
+echo "==> Patching mlx_whisper (lazy timing import)"
+( cd "$SITE" && patch -p1 < "$ROOT/patches/mlx-whisper-lazy-timing.patch" )
+
 # --- 6. Strip caches and unused locale data to reduce bundle size ---
 echo "==> Stripping caches"
 find "$SITE" -name "__pycache__" -type d -prune -exec rm -rf {} +
@@ -91,8 +100,12 @@ find "$SITE" -name "tests" -type d -prune -exec rm -rf {} + 2>/dev/null || true
 # does not pull it in, and our transcribe() path is pure-MLX. Removing torch
 # saves ~390 MB; sympy/networkx are torch-only deps and follow it out.
 # torchgen / functorch are torch's own subpackages installed separately.
-echo "==> Pruning unused transitive deps (torch family)"
-for pkg in torch torchgen functorch sympy networkx; do
+#
+# scipy/numba/llvmlite are pulled in by mlx_whisper.timing (word-level
+# timestamps). The patch in step 5b makes that import lazy, so we never
+# load these modules and can drop them from disk too.
+echo "==> Pruning unused transitive deps"
+for pkg in torch torchgen functorch sympy networkx scipy numba llvmlite; do
     find "$SITE" -maxdepth 1 \
         \( -name "$pkg" -o -name "${pkg}-*.dist-info" \) \
         -exec rm -rf {} + 2>/dev/null || true
