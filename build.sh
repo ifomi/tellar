@@ -39,9 +39,20 @@ mkdir -p "$PY_DIR" "$APP_DIR" "$SITE" "$MACOS"
 
 # --- 3. Extract embedded Python (zstd-compressed tarball) ---
 echo "==> Extracting Python runtime"
-# Tarball top-level dir is 'python/', strip it so contents land directly in PY_DIR.
+# pgo+lto-full layout: tarball has python/{PYTHON.json,build,install,licenses}.
+# The runnable interpreter and its libs/headers live under python/install/.
+# We extract to a temp dir, then copy only install/ contents into PY_DIR —
+# build/ and licenses/ are CPython source-build artifacts we don't need.
 # BSD tar on macOS 13+ understands --zstd natively.
-tar --zstd -xf "$TARBALL" -C "$PY_DIR" --strip-components=1
+WORK="$(mktemp -d /tmp/tellar-pybs-XXXXXX)"
+tar --zstd -xf "$TARBALL" -C "$WORK"
+if [ ! -d "$WORK/python/install" ]; then
+    echo "ERROR: unexpected tarball layout — no python/install/ dir"
+    rm -rf "$WORK"
+    exit 1
+fi
+cp -R "$WORK/python/install/." "$PY_DIR/"
+rm -rf "$WORK"
 EMBEDDED_PY="$PY_DIR/bin/python3.12"
 if [ ! -x "$EMBEDDED_PY" ]; then
     echo "ERROR: embedded python not found at $EMBEDDED_PY after extraction"
