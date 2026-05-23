@@ -84,6 +84,11 @@ class Bridge(QObject):
     transcription_empty = pyqtSignal()
     model_ready = pyqtSignal()
     model_error = pyqtSignal(str)
+    # Phase 4: download model on first launch (or after cache wipe).
+    # Progress: (percent, mb_done, mb_total). Finished: switch overlay to
+    # "Loading model..." while mlx_whisper.load_model runs.
+    model_download_progress = pyqtSignal(int, int, int)
+    model_download_finished = pyqtSignal()
 
 
 class OverlayWidget(QWidget):
@@ -95,10 +100,19 @@ class OverlayWidget(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Tool windows on macOS hide when their owning app becomes inactive
+        # (e.g. user clicks away during a long model download). This attribute
+        # keeps the overlay visible across focus changes — critical for the
+        # download-progress UI which the user needs to monitor while working
+        # in other apps.
+        self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
         self.setFixedSize(150, 120)
         self._bars = [0.0] * WAVEFORM_BARS
         self._mode = "idle"
         self._elapsed = ""
+        self._status_text = ""
+        self._substatus_text = ""
+        self._dl_pct = 0
         self._spin_frame = 0
         self._spin_timer = QTimer()
         self._spin_timer.setInterval(200)
@@ -168,7 +182,7 @@ class OverlayWidget(QWidget):
             p.setPen(QColor(255, 255, 255, 100))
             p.drawText(QRectF(0, 98, self.width(), 16), Qt.AlignmentFlag.AlignCenter, "⌃Space · ⌃Esc")
 
-        elif self._mode in ("loading", "transcribing", "done", "error"):
+        elif self._mode in ("loading", "transcribing", "done", "error", "downloading"):
             p.setFont(QFont("Helvetica Neue", 13, QFont.Weight.DemiBold))
             if self._mode == "error":
                 p.setPen(QColor(255, 100, 100, 240))
@@ -188,6 +202,19 @@ class OverlayWidget(QWidget):
                     p.setPen(Qt.PenStyle.NoPen)
                     x = cx + (i - 1) * gap
                     p.drawEllipse(x - dot_r, y - dot_r, dot_r * 2, dot_r * 2)
+
+            if self._mode == "downloading":
+                bar_w = 110
+                bar_h = 6
+                bar_x = (self.width() - bar_w) // 2
+                bar_y = 72
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 255, 255, 50))
+                p.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 3, 3)
+                if self._dl_pct > 0:
+                    fill_w = max(bar_h, int(bar_w * self._dl_pct / 100))
+                    p.setBrush(QColor(120, 200, 255, 230))
+                    p.drawRoundedRect(bar_x, bar_y, fill_w, bar_h, 3, 3)
 
             if self._substatus_text:
                 p.setFont(QFont("Helvetica Neue", 10))
@@ -218,6 +245,26 @@ class OverlayWidget(QWidget):
         self._move_to_position()
         self.show()
         self.raise_()
+        self.update()
+
+    def show_downloading(self):
+        self._mode = "downloading"
+        self._status_text = "Downloading model"
+        self._substatus_text = "preparing…"
+        self._dl_pct = 0
+        self._move_to_position()
+        self.show()
+        self.raise_()
+        self.update()
+
+    def update_download_progress(self, pct: int, mb_done: int, mb_total: int):
+        if self._mode != "downloading":
+            return
+        self._dl_pct = pct
+        if mb_total > 0:
+            self._substatus_text = f"{pct}%  {mb_done} / {mb_total} MB"
+        else:
+            self._substatus_text = f"{mb_done} MB"
         self.update()
 
     def show_recording(self, elapsed: str = "0:00"):
@@ -553,20 +600,31 @@ def main():
     tellar.bridge.transcription_empty.connect(tellar._finish)
     tellar.bridge.model_ready.connect(tellar.on_model_ready)
     tellar.bridge.model_error.connect(tellar.on_model_error)
+    tellar.bridge.model_download_progress.connect(tellar.overlay.update_download_progress)
+    # When download finishes, transition the overlay to "Loading model..." while
+    # mlx_whisper imports and load_model run.
+    tellar.bridge.model_download_finished.connect(tellar.overlay.show_loading)
 
     if not model_exists():
         log.info("Whisper model not found locally, will download on preload")
-        print(f"Downloading whisper model to {MODEL_DIR}...")
-        tellar.overlay.show_loading()
+        tellar.overlay.show_downloading()
     else:
         log.info("Whisper model already cached")
+        tellar.overlay.show_loading()
 
     def preload_model():
         import time
         t0 = time.time()
         log.info("Preloading whisper model...")
+
+        def on_progress(pct, mb_done, mb_total):
+            tellar.bridge.model_download_progress.emit(pct, mb_done, mb_total)
+
         try:
-            get_model()
+            get_model(on_download_progress=on_progress)
+            # Always emit — if no download happened it's a no-op nudge that just
+            # keeps the overlay in "loading" mode (where it already is).
+            tellar.bridge.model_download_finished.emit()
         except Exception as e:
             log.exception("Model preload failed")
             tellar.bridge.model_error.emit(str(e))

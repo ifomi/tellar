@@ -70,14 +70,14 @@ find "$APP_DIR/tellar" -name "*.pyc" -delete
 echo "==> Installing pip dependencies into $SITE"
 "$EMBEDDED_PY" -m pip install --upgrade pip wheel
 "$EMBEDDED_PY" -m pip install --target "$SITE" \
-    "mlx-whisper>=0.4" \
-    "mlx>=0.21" \
+    "mlx-whisper==0.4.3" \
+    "mlx==0.29.3" \
+    "numpy<2.1" \
     "huggingface-hub>=0.20" \
     "PyQt6>=6.6" \
     "pyobjc-framework-Cocoa>=10.0" \
     "pyobjc-framework-Quartz>=10.0" \
-    "pyaudio>=0.2" \
-    "numpy>=1.24"
+    "pyaudio>=0.2"
 
 # --- 5b. Patch mlx_whisper for lazy timing import ---
 # transcribe.py eagerly imports .timing at module load, which pulls in scipy
