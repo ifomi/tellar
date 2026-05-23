@@ -13,6 +13,25 @@ log = get_logger(__name__)
 MODEL_NAME = "mlx-community/whisper-large-v3-turbo"
 MODEL_DIR = Path.home() / "Library" / "Application Support" / "Tellar" / "models"
 
+# Bias whisper-large-v3-turbo's decoder toward producing punctuation,
+# capitalization, and proper sentence breaks. The turbo model is a distilled
+# variant that drops these stylistic features when it can't infer sentence
+# boundaries from the audio alone (fast unbroken speech, repeated words,
+# nominal phrases). A short prompt with the target style nudges the decoder
+# to continue in that style — a zero-cost fix that empirically takes our
+# bad-output rate from ~50% to 0% on the diagnostic samples.
+#
+# initial_prompt does NOT lock the language — whisper still detects it from
+# the audio. We use a bilingual RU/EN prompt because the user dictates in
+# both languages (sometimes mixed within a single utterance). A single-
+# language prompt biases cross-language outputs in subtle ways (transliteration
+# artifacts, leakage of stop-words from the prompt language). Both languages
+# present means whichever the decoder lands on, it has style context for it.
+PUNCTUATION_PROMPT = (
+    "Привет, как дела? Сегодня хороший день. "
+    "Hello, how are you? Today is a great day."
+)
+
 _model_loaded = False
 
 # (pct, mb_done, mb_total)
@@ -149,6 +168,7 @@ def transcribe_audio(audio_path: str) -> str:
     result = mlx_whisper.transcribe(
         audio,
         path_or_hf_repo=MODEL_NAME,
+        initial_prompt=PUNCTUATION_PROMPT,
         # Use whisper's default temperature schedule (0.0, 0.2, 0.4, 0.6, 0.8, 1.0).
         # The first pass is greedy at T=0 — same as fixing temperature=0.0 — but if
         # `compression_ratio_threshold` trips on a degenerate output (greedy
