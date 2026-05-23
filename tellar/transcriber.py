@@ -28,38 +28,7 @@ def get_model():
     log.info("Loading model %s into memory...", MODEL_NAME)
     load_model(MODEL_NAME)
     log.info("Model loaded in %.2fs", time.time() - t1)
-    _warmup_model()
     _model_loaded = True
-
-
-def _warmup_model():
-    # Cold-start fix: the first transcribe call compiles Metal compute kernels
-    # (mel spectrogram, encoder attention, decoder steps) on the GPU. JIT
-    # compilation slightly perturbs numerical paths inside greedy decoding,
-    # and we observed the first real transcription consistently dropping
-    # capitalization and punctuation. Running one warmup pass on noise here
-    # forces every kernel to compile before the user records anything.
-    #
-    # We feed low-amplitude white noise (not silence) and set
-    # no_speech_threshold=1.0 so whisper never short-circuits as "no speech"
-    # and the full decoder loop actually runs — otherwise decoder kernels
-    # wouldn't compile and the warmup would be incomplete.
-    t0 = time.time()
-    try:
-        import mlx_whisper
-        rng = np.random.default_rng(0)
-        warmup_audio = (rng.standard_normal(16000) * 0.05).astype(np.float32)
-        mlx_whisper.transcribe(
-            warmup_audio,
-            path_or_hf_repo=MODEL_NAME,
-            temperature=0.0,
-            no_speech_threshold=1.0,
-            compression_ratio_threshold=2.0,
-            verbose=None,
-        )
-        log.info("Model warmup completed in %.2fs", time.time() - t0)
-    except Exception as e:
-        log.warning("Warmup transcribe failed (non-fatal): %s", e)
 
 
 def model_exists() -> bool:
@@ -96,12 +65,14 @@ def transcribe_audio(audio_path: str) -> str:
     result = mlx_whisper.transcribe(
         audio,
         path_or_hf_repo=MODEL_NAME,
-        # Greedy, deterministic decoding. The default schedule is a tuple
-        # (0.0, 0.2, 0.4, 0.6, 0.8, 1.0): whisper retries with rising
-        # temperature whenever compression_ratio_threshold trips, and the
-        # higher-T outputs lose capitalization and punctuation. Pinning to 0
-        # means same audio → same text, every run.
-        temperature=0.0,
+        # Use whisper's default temperature schedule (0.0, 0.2, 0.4, 0.6, 0.8, 1.0).
+        # The first pass is greedy at T=0 — same as fixing temperature=0.0 — but if
+        # `compression_ratio_threshold` trips on a degenerate output (greedy
+        # occasionally drops capitalization/punctuation and becomes repetitive),
+        # whisper retries at the next temperature in the schedule. That retry is
+        # the recovery path Wizper relies on. We previously pinned T=0.0 thinking
+        # it would prevent quality drift, but it just disabled the recovery and
+        # the bad first-pass output shipped as-is.
         no_speech_threshold=0.5,
         compression_ratio_threshold=2.0,
     )
