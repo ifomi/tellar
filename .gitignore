@@ -16,3 +16,8 @@ Tellar.app/Contents/MacOS/tellar
 # Icon pipeline: keep source PNG + final ICNS in git, ignore intermediate
 # iconset that iconutil consumes.
 assets/Tellar.iconset/
+
+# DMG distribution artifacts — built on demand via package.sh, never committed.
+Tellar-*.dmg
+build-cache/dmg-staging/
+build-cache/dmg-temp.dmg
