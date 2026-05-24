@@ -14,8 +14,9 @@ from AppKit import (
     NSObject,
     NSFont,
     NSFontAttributeName,
+    NSAlert,
 )
-from Foundation import NSData, NSAttributedString
+from Foundation import NSData, NSAttributedString, NSBundle
 import objc
 
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
@@ -64,6 +65,7 @@ class _MenuController(NSObject):
             return None
         self._cb = cb
         self._auto_paste_item = None
+        self._model_name = cb.get("model_name", "?")
         return self
 
     def doToggle_(self, sender):
@@ -76,6 +78,29 @@ class _MenuController(NSObject):
         fn = self._cb.get("auto_paste_changed")
         if fn:
             fn(bool(sender.state()))
+
+    def doAbout_(self, sender):
+        # Show a native NSAlert with build info. Version comes from the
+        # bundle's CFBundleShortVersionString (no need to thread it through
+        # in code — Info.plist is canonical). Model is whatever transcriber
+        # is configured to load.
+        bundle = NSBundle.mainBundle()
+        info = bundle.infoDictionary() or {}
+        version = info.get("CFBundleShortVersionString", "?")
+        body = (
+            "Local push-to-talk voice dictation for macOS.\n\n"
+            "⌃Space  start / stop recording\n"
+            "⌃Esc    cancel\n\n"
+            "Result is pasted into the active app, or just copied to the "
+            "clipboard when Auto Paste is off (toggle in the menubar menu).\n\n"
+            f"Speech recognition: {self._model_name}\n"
+            "Runs entirely on this Mac — no cloud, no network calls "
+            "after the model is downloaded."
+        )
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(f"Tellar {version}")
+        alert.setInformativeText_(body)
+        alert.runModal()
 
     def doQuit_(self, sender):
         # Quit via Qt, not NSApp.terminate(). In a hybrid PyQt + AppKit app,
@@ -93,7 +118,9 @@ class _MenuController(NSObject):
 class MenuBarIcon:
     """Public Pythonic API around NSStatusItem + NSMenu."""
 
-    def __init__(self, on_toggle: Callable[[], None], on_auto_paste_changed: Optional[Callable[[bool], None]] = None):
+    def __init__(self, on_toggle: Callable[[], None],
+                 on_auto_paste_changed: Optional[Callable[[bool], None]] = None,
+                 model_name: str = "?"):
         self._bar = NSStatusBar.systemStatusBar()
         # Variable length so the item resizes to fit a wide title (e.g. "0:01"
         # timer text). Square length clipped multi-character titles.
@@ -106,6 +133,7 @@ class MenuBarIcon:
         self._controller = _MenuController.alloc().initWithCallbacks_({
             "toggle": on_toggle,
             "auto_paste_changed": on_auto_paste_changed,
+            "model_name": model_name,
         })
         # Keep strong reference so ARC doesn't deallocate
         objc.setAssociatedObject(self._item, b"controller", self._controller, 0x301)
@@ -127,6 +155,14 @@ class MenuBarIcon:
         self._auto_paste_item.setTarget_(self._controller)
         self._auto_paste_item.setState_(1)
         menu.addItem_(self._auto_paste_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        about_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "About Tellar…", "doAbout:", ""
+        )
+        about_item.setTarget_(self._controller)
+        menu.addItem_(about_item)
 
         menu.addItem_(NSMenuItem.separatorItem())
 

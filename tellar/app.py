@@ -776,7 +776,10 @@ def main():
     # before Qt takes over. The on_toggle callback is wired up via a holder
     # because TellarApp doesn't exist yet.
     _toggle_holder = [None]
-    menubar = MenuBarIcon(on_toggle=lambda: _toggle_holder[0]() if _toggle_holder[0] else None)
+    menubar = MenuBarIcon(
+        on_toggle=lambda: _toggle_holder[0]() if _toggle_holder[0] else None,
+        model_name=MODEL_NAME,
+    )
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
