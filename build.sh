@@ -77,6 +77,7 @@ echo "==> Installing pip dependencies into $SITE"
     "PyQt6>=6.6" \
     "pyobjc-framework-Cocoa>=10.0" \
     "pyobjc-framework-Quartz>=10.0" \
+    "pyobjc-framework-ApplicationServices>=10.0" \
     "pyaudio>=0.2"
 
 # --- 5b. Patch mlx_whisper for lazy timing import ---
