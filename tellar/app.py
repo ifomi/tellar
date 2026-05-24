@@ -26,33 +26,48 @@ STATE_DIR = Path.home() / "Library" / "Application Support" / "Tellar"
 POSITION_FILE = STATE_DIR / "overlay_position.json"
 
 
+# Path to the brand silhouette used as the menubar icon. The PNG is a
+# pre-rendered alpha mask (transparent background, opaque black where the
+# Tellar t+wave shape is), generated from assets/icon.png — see the
+# regenerate-menubar-silhouette script in repo docs. Living inside the
+# Python package means build.sh's `cp -R "$ROOT/tellar"` already ships it.
+_SILHOUETTE_PATH = Path(__file__).parent / "menubar_silhouette.png"
+_silhouette_master: Optional[QPixmap] = None
+
+
 def _make_wave_pixmap(color: str) -> QPixmap:
-    scale = 2
-    size = 22 * scale
-    pm = QPixmap(size, size)
-    pm.setDevicePixelRatio(scale)
+    """Return a 22pt-tall menubar pixmap of the Tellar silhouette tinted in `color`.
+
+    Generated at exact retina pixel size (44px tall, width following the
+    silhouette's natural aspect). No devicePixelRatio — qpixmap_to_nsimage
+    in menubar.py maps pixel size → logical point size by dividing by 2.
+    Earlier DPR-based approach produced half-pixel logical widths (30.5pt)
+    which confused NSStatusBarButton sizing.
+    """
+    global _silhouette_master
+    if _silhouette_master is None:
+        _silhouette_master = QPixmap(str(_SILHOUETTE_PATH))
+    src_w, src_h = _silhouette_master.width(), _silhouette_master.height()
+    px_h = 44  # 22pt logical at retina; AppKit downscales for 1x displays
+    px_w = max(px_h, int(round(src_w * px_h / src_h)))
+    # Make sure px_w is even — avoids half-pixel issues when divided by 2
+    # to derive logical width in qpixmap_to_nsimage.
+    if px_w % 2:
+        px_w += 1
+    scaled = _silhouette_master.scaled(
+        px_w, px_h,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    pm = QPixmap(px_w, px_h)
     pm.fill(QColor(0, 0, 0, 0))
     p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-    # A single arc above a source dot — minimal "signal/tell" mark.
-    cx, cy = 11.0, 14.0
-
-    pen = QPen(QColor(color))
-    pen.setWidthF(2.2)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    p.setPen(pen)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-
-    r = 9.0
-    arc_rect = QRectF(cx - r, cy - r, r * 2, r * 2)
-    p.drawArc(arc_rect, 0, 180 * 16)
-
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor(color))
-    dot_d = 4.0
-    p.drawEllipse(QRectF(cx - dot_d / 2, cy - dot_d / 2, dot_d, dot_d))
-
+    # Centre horizontally in case scaled width came back smaller than px_w
+    # (KeepAspectRatio rounding).
+    p.drawPixmap((px_w - scaled.width()) // 2, 0, scaled)
+    # Replace the silhouette's black with the requested colour.
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    p.fillRect(pm.rect(), QColor(color))
     p.end()
     return pm
 

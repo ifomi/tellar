@@ -40,10 +40,15 @@ def qpixmap_to_nsimage(pix: QPixmap) -> NSImage:
     nsdata = NSData.dataWithBytes_length_(bytes(buf), buf.size())
     img = NSImage.alloc().initWithData_(nsdata)
     if img and img.isValid():
-        # Explicit point size — menu bar items are 22pt tall.
-        # Without this, NSImage uses pixel-size of the PNG (44px from retina
-        # QPixmap), which AppKit may render too large for the status bar.
-        img.setSize_((22.0, 22.0))
+        # We deliberately render the pixmap at exact retina pixel size
+        # (44px tall for a 22pt menubar slot) without using Qt's
+        # devicePixelRatio. So the conversion to logical points is just
+        # divide-by-2. This guarantees integer logical sizes; the
+        # devicePixelRatio path produced half-pixel widths (e.g. 30.5pt)
+        # which made NSStatusBarButton render the icon clipped/tiny.
+        logical_w = pix.width() / 2.0
+        logical_h = pix.height() / 2.0
+        img.setSize_((logical_w, logical_h))
     log.debug("qpixmap_to_nsimage: PNG bytes=%d, NSImage valid=%s, size=%s",
               buf.size(), img.isValid() if img else False,
               img.size() if img else None)

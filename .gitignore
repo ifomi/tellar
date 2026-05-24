@@ -9,5 +9,10 @@ build-cache/
 Tellar.app/Contents/Resources/python/
 Tellar.app/Contents/Resources/app/site-packages/
 Tellar.app/Contents/Resources/app/tellar/
+Tellar.app/Contents/Resources/icon.icns
 Tellar.app/Contents/_CodeSignature/
 Tellar.app/Contents/MacOS/tellar
+
+# Icon pipeline: keep source PNG + final ICNS in git, ignore intermediate
+# iconset that iconutil consumes.
+assets/Tellar.iconset/

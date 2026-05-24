@@ -66,6 +66,15 @@ cp -R "$ROOT/tellar" "$APP_DIR/tellar"
 find "$APP_DIR/tellar" -name "__pycache__" -type d -prune -exec rm -rf {} +
 find "$APP_DIR/tellar" -name "*.pyc" -delete
 
+# --- 4b. Copy app icon ---
+# Info.plist references CFBundleIconFile=icon, so macOS expects icon.icns
+# in Resources/. The pre-built .icns lives in assets/ (regenerable from
+# assets/icon.png via the iconset/iconutil pipeline if the source changes).
+if [ -f "$ROOT/assets/icon.icns" ]; then
+    cp "$ROOT/assets/icon.icns" "$RES/icon.icns"
+    echo "    icon: $RES/icon.icns"
+fi
+
 # --- 5. Install runtime deps with embedded Python ---
 echo "==> Installing pip dependencies into $SITE"
 "$EMBEDDED_PY" -m pip install --upgrade pip wheel
