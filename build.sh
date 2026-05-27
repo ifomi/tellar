@@ -32,8 +32,11 @@ fi
 echo "    using $TARBALL"
 
 # --- 2. Clean previous build artifacts ---
+# Stale _CodeSignature is worse than no signature: macOS sees the manifest
+# and tries to validate hashes against current Resources/, fails, and refuses
+# to launch the app with no override option. Wipe it; we re-sign in step 9.
 echo "==> Cleaning previous build"
-rm -rf "$PY_DIR" "$APP_DIR/tellar" "$SITE"
+rm -rf "$PY_DIR" "$APP_DIR/tellar" "$SITE" "$APP/Contents/_CodeSignature"
 rm -f "$MACOS/tellar" "$MACOS/tellar-py"
 mkdir -p "$PY_DIR" "$APP_DIR" "$SITE" "$MACOS"
 
@@ -76,9 +79,14 @@ if [ -f "$ROOT/assets/icon.icns" ]; then
 fi
 
 # --- 5. Install runtime deps with embedded Python ---
+# pip on this machine cannot reach pypi.org directly (Apple corporate proxy
+# returns 403). Apple's internal mirror at pypi.apple.com proxies the public
+# index transparently. Pinning --index-url here makes the build work on
+# Apple network without depending on env/global pip config.
 echo "==> Installing pip dependencies into $SITE"
-"$EMBEDDED_PY" -m pip install --upgrade pip wheel
-"$EMBEDDED_PY" -m pip install --target "$SITE" \
+PIP_INDEX="https://pypi.apple.com/simple/"
+"$EMBEDDED_PY" -m pip install --index-url "$PIP_INDEX" --upgrade pip wheel
+"$EMBEDDED_PY" -m pip install --index-url "$PIP_INDEX" --target "$SITE" \
     "mlx-whisper==0.4.3" \
     "mlx==0.29.3" \
     "numpy<2.1" \
@@ -121,6 +129,75 @@ for pkg in torch torchgen functorch sympy networkx scipy numba llvmlite; do
         -exec rm -rf {} + 2>/dev/null || true
 done
 
+# Remove unused PyQt6 plugins that link to external system libraries the
+# recipient won't have. Specifically the SQL drivers — libqsqlmimer needs
+# libmimerapi, libqsqlodbc needs libiodbc, libqsqlpsql needs libpq from
+# Postgres.app. Tellar never imports QtSql, so these are dead code that
+# would otherwise trip the external-deps audit below.
+echo "==> Removing unused PyQt6 plugins"
+rm -rf "$SITE/PyQt6/Qt6/plugins/sqldrivers"
+
+# --- 6c. Bundle external dylibs that pip-installed C extensions reference ---
+# Some Python C extensions (notably pyaudio's _portaudio.so) are compiled
+# against system libraries installed via Homebrew. The compiled .so embeds
+# the absolute path of the build-machine's library as a load command. On a
+# fresh recipient machine without that exact Homebrew layout, dlopen fails
+# with "Library not loaded: /opt/homebrew/...". The bundle isn't actually
+# self-contained until we copy those dylibs in and rewrite the load commands.
+#
+# Audit pattern: any .so or .dylib in Resources/ whose otool -L lists a path
+# starting with /opt/homebrew/, /usr/local/, /Users/, or /Applications/ —
+# i.e. a non-system, non-bundle absolute path the recipient won't have.
+#
+# Currently handled:
+#   pyaudio/_portaudio.so → /opt/homebrew/.../libportaudio.2.dylib
+#
+# Not handled (because Tellar doesn't import them; they ship dead code only):
+#   PyQt6/Qt6/plugins/sqldrivers/{libqsqlmimer, libqsqlodbc, libqsqlpsql}.dylib
+#
+# If a new external dep appears in the future, the audit at the bottom will
+# fail loudly so we know to add it explicitly here.
+echo "==> Bundling external dylibs"
+PYAUDIO_DIR="$SITE/pyaudio"
+PORTAUDIO_SO="$PYAUDIO_DIR/_portaudio.cpython-312-darwin.so"
+if [ -f "$PORTAUDIO_SO" ]; then
+    PORTAUDIO_SRC=/opt/homebrew/opt/portaudio/lib/libportaudio.2.dylib
+    if [ ! -f "$PORTAUDIO_SRC" ]; then
+        echo "ERROR: $PORTAUDIO_SRC missing. brew install portaudio first."
+        exit 1
+    fi
+    PORTAUDIO_DST="$PYAUDIO_DIR/libportaudio.2.dylib"
+    cp "$PORTAUDIO_SRC" "$PORTAUDIO_DST"
+    # Homebrew installs portaudio as r--r--r-- (read-only owner). cp preserves
+    # that, which later breaks `xattr -dr com.apple.quarantine` on the
+    # recipient's side — xattr needs write access to update metadata. Add
+    # owner write permission so quarantine cleanup works in the install path.
+    chmod u+w "$PORTAUDIO_DST"
+    install_name_tool -id @loader_path/libportaudio.2.dylib "$PORTAUDIO_DST" 2>&1 | grep -v "^/.*install_name_tool: warning" || true
+    install_name_tool -change "$PORTAUDIO_SRC" @loader_path/libportaudio.2.dylib "$PORTAUDIO_SO" 2>&1 | grep -v "^/.*install_name_tool: warning" || true
+    echo "    libportaudio.2.dylib bundled into pyaudio/"
+fi
+
+# Audit: refuse to ship a bundle that still references external paths.
+# Better to fail the build than ship a non-portable .app.
+#
+# Note on the `|| true` after grep: with `set -euo pipefail`, a grep that
+# finds zero matches exits 1 and tears down the whole pipeline silently
+# (no error message, just an early script exit). We *want* zero matches —
+# that's the success case. `|| true` neutralises that exit.
+echo "==> Auditing remaining external dylib references"
+EXTERNAL=$(find "$RES" \( -name "*.so" -o -name "*.dylib" \) -type f -print0 | \
+    xargs -0 -I {} otool -L {} 2>/dev/null | \
+    { grep -E "^\s+(/opt/homebrew|/usr/local|/Users|/Applications)" || true; } | \
+    awk '{print $1}' | sort -u)
+if [ -n "$EXTERNAL" ]; then
+    echo "ERROR: Bundle still references external (non-system) dylibs:"
+    echo "$EXTERNAL" | sed 's/^/    /'
+    echo "    Either bundle them in step 6c, or delete the consuming package."
+    exit 1
+fi
+echo "    clean"
+
 # --- 7. Compile native launcher ---
 # launcher.c embeds CPython via Py_Initialize() so the binary at MacOS/tellar
 # is the actual process — not a bash script that exec()s python3.12. This is
@@ -137,6 +214,40 @@ echo "    launcher: $(file "$MACOS/tellar" | sed 's|^[^:]*: ||')"
 
 # --- 8. Touch .app to invalidate Launch Services cache ---
 touch "$APP"
+
+# --- 9. Sign the bundle ad-hoc ---
+# Pip and tar drop fresh dylibs into Resources/ on every build, so the bundle
+# must be re-signed end-to-end. Without this, Gatekeeper rejects the app on
+# the recipient's machine ("can't be opened", no override).
+#
+# Two non-obvious gotchas:
+#
+# 1. NO --options runtime. Hardened runtime enables library validation,
+#    which refuses to load any dylib whose Team ID does not match the main
+#    executable. Our launcher is ad-hoc (no Team ID); libpython3.12.dylib
+#    from python-build-standalone has Apple's Team ID. Result: dyld blocks
+#    the load with "different Team IDs". Hardened runtime is only useful
+#    if we're going to notarize (Apple Developer ID + notarytool) — for
+#    ad-hoc personal distribution it just breaks things.
+#
+# 2. Explicit sign every dylib/.so under Resources/ FIRST, then the bundle.
+#    `codesign --deep` only descends into Contents/Frameworks, PlugIns, and
+#    MacOS — it skips Resources/. Embedded Python lives in Resources/python,
+#    its C extensions in Resources/app/site-packages. Without per-file
+#    signing, those keep their original (or no) signatures and library
+#    validation rejects them even with hardened runtime off, on stricter
+#    systems.
+#
+# Ad-hoc (-) is enough for personal distribution; the recipient still
+# right-clicks → Open or uses System Settings → Privacy & Security → Open
+# Anyway the first time because the DMG carries com.apple.quarantine.
+echo "==> Signing embedded dylibs/so files"
+find "$RES" \( -name "*.dylib" -o -name "*.so" \) -type f -print0 | \
+    xargs -0 -n 50 codesign --force --sign - 2>&1 | grep -v "replacing existing signature" || true
+
+echo "==> Signing bundle (ad-hoc, no hardened runtime)"
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP" && echo "    signature OK"
 
 BUNDLE_SIZE=$(du -sh "$APP" | cut -f1)
 echo

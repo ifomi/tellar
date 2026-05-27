@@ -105,6 +105,7 @@ int main(int argc, char *argv[]) {
         // Ensure the child sees the same PYTHONHOME/PYTHONPATH we'd use.
         setenv("PYTHONHOME", python_home, 1);
         setenv("PYTHONPATH", pythonpath, 1);
+        setenv("PYTHONDONTWRITEBYTECODE", "1", 1);
         execv(real_python, argv);
         // Only reached if execv failed.
         fprintf(stderr, "tellar: execv(%s) failed: %s\n", real_python, strerror(errno));
@@ -125,6 +126,13 @@ int main(int argc, char *argv[]) {
     setenv("PYTHONHOME", python_home, 1);
     setenv("PYTHONPATH", pythonpath, 1);
     setenv("PYTHONIOENCODING", "utf-8", 1);
+    // Don't write .pyc files. The bundle's _CodeSignature seals every file
+    // under Contents/; if Python writes __pycache__/*.pyc on first import,
+    // the bundle hash diverges from the sealed manifest. macOS may then
+    // re-evaluate the signature (e.g. after reboot or system update) and
+    // reject the app as "damaged". Disabling bytecode caching trades a
+    // tiny startup cost for a stable, immutable bundle.
+    setenv("PYTHONDONTWRITEBYTECODE", "1", 1);
     // overwrite=0: only set if user hasn't configured locale themselves.
     setenv("LANG", "en_US.UTF-8", 0);
     setenv("LC_ALL", "en_US.UTF-8", 0);

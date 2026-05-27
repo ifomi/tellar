@@ -81,8 +81,14 @@ hdiutil attach "$TEMP_DMG" -mountpoint "$MOUNT_POINT" -nobrowse >/dev/null
 # Triggers a one-time "Tellar wants to control Finder" prompt on the dev
 # machine. Recipients don't see it — by the time they get the DMG, the
 # window layout is already baked in.
+#
+# Made non-fatal: when Automation permission is denied, the DMG still
+# functions correctly (just lacks the custom background and icon layout).
+# A failure here is far less serious than a missing DMG — without this
+# safeguard, every set -e tripped on "privilege violation" aborts the run.
 echo "==> Configuring Finder window layout"
-osascript <<APPLESCRIPT
+LAYOUT_OK=true
+osascript <<APPLESCRIPT || LAYOUT_OK=false
 tell application "Finder"
     tell disk "$NAME"
         open
@@ -102,6 +108,11 @@ tell application "Finder"
     end tell
 end tell
 APPLESCRIPT
+if [ "$LAYOUT_OK" = false ]; then
+    echo "    WARNING: Finder layout step failed (Automation permission denied?)"
+    echo "    DMG will still work but show default Finder view, no background image."
+    echo "    Grant the calling shell Automation→Finder access in System Settings to fix."
+fi
 
 # Brief sync so Finder writes its .DS_Store metadata onto the DMG.
 sync
