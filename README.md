@@ -2,7 +2,7 @@
 
 Local push-to-talk voice dictation for Apple Silicon Mac.
 
-Hold `⌃Space`, talk, release — your words appear in whatever app you have focused. Runs entirely on your Mac via [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper). No cloud, no telemetry, no network calls after the model is downloaded once.
+Press `⌃Space`, talk, press  `⌃Space` when done — your words appear in whatever app you have focused. Runs entirely on your Mac via [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper). No cloud, no telemetry, no network calls after the model is downloaded once.
 
 ## Requirements
 
