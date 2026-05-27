@@ -107,6 +107,8 @@ def _download_model(on_progress: ProgressCallback):
             # this subclass exists purely to relay byte counts to the UI.
             kwargs["disable"] = False
             super().__init__(*args, **kwargs)
+            self._last_emit_pct = -1
+            self._last_emit_time = 0.0
 
         def update(self, n=1):
             ret = super().update(n)
@@ -119,11 +121,23 @@ def _download_model(on_progress: ProgressCallback):
             if on_progress and self.unit == "B" and self.total:
                 try:
                     pct = min(100, int(self.n * 100 / self.total))
-                    on_progress(
-                        pct,
-                        self.n // (1024 * 1024),
-                        self.total // (1024 * 1024),
-                    )
+                    # Throttle signal emission. hf_xet downloads chunks in
+                    # parallel and fires update() many times per second; if
+                    # we relay every one as a Qt signal, the main thread's
+                    # event queue chokes and stops servicing menubar clicks
+                    # AND the permissions poll timer — exactly the "icon
+                    # unresponsive, second permission never appears" symptom
+                    # observed during first-launch model download. Emit on
+                    # percent change OR every 0.5s, whichever first.
+                    now = time.time()
+                    if pct != self._last_emit_pct or (now - self._last_emit_time) > 0.5:
+                        on_progress(
+                            pct,
+                            self.n // (1024 * 1024),
+                            self.total // (1024 * 1024),
+                        )
+                        self._last_emit_pct = pct
+                        self._last_emit_time = now
                 except Exception:
                     log.exception("download progress callback failed")
             return ret

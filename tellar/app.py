@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import fcntl
+import time
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -109,6 +110,30 @@ def _open_input_monitoring_settings():
     ])
 
 
+def _restart_tellar():
+    """Schedule a relaunch of Tellar (via `open` after a 1s delay) and
+    quit Qt. Needed because AXIsProcessTrusted() caches per-process —
+    even after the user toggles Accessibility in Settings, our running
+    Tellar keeps reporting the permission as missing. Restarting from
+    scratch is the only reliable way to refresh.
+
+    start_new_session=True detaches the helper shell from our process
+    group so it survives our exit. Without it, the orphan shell can be
+    cleaned up before `sleep 1` finishes, and `open` never runs."""
+    import subprocess
+    from Foundation import NSBundle
+    bundle_path = NSBundle.mainBundle().bundlePath()
+    log.info("Restarting Tellar via %s", bundle_path)
+    subprocess.Popen(
+        ["/bin/sh", "-c", f"sleep 1 && open '{bundle_path}'"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    QApplication.instance().quit()
+
+
 def _check_permissions():
     """Return (accessibility_ok, input_monitoring_ok).
 
@@ -188,6 +213,12 @@ class OverlayWidget(QWidget):
         self._status_text = ""
         self._substatus_text = ""
         self._dl_pct = 0
+        # Latest download numbers — kept in sync by update_download_progress
+        # so a transition INTO the downloading overlay (e.g. from
+        # permissions_needed) shows current progress immediately rather
+        # than "preparing…" from scratch.
+        self._dl_mb_done = 0
+        self._dl_mb_total = 0
         # Phase 5: per-permission state for the permissions_needed mode.
         # True = granted, False = missing.
         self._perm_acc = True
@@ -254,13 +285,18 @@ class OverlayWidget(QWidget):
             self._save_position()
             return
         if self._mode == "permissions_needed":
-            # Open the pane for the first missing permission. After the user
-            # grants and relaunches, if the other one is still missing the
-            # next launch will open that pane. One step at a time.
             if not self._perm_im:
+                # First missing — Input Monitoring. Open its pane.
                 _open_input_monitoring_settings()
             elif not self._perm_acc:
-                _open_accessibility_settings()
+                # IM granted, A still missing. The user has either not
+                # toggled A yet (auto-pane already opened it) or toggled
+                # it but AXIsProcessTrusted's cache is stale. Either way
+                # restarting Tellar is the sensible action — fresh
+                # process refreshes the cache. If user hadn't toggled
+                # yet, the new launch re-opens the A pane via the same
+                # auto-pane navigation logic.
+                _restart_tellar()
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -366,11 +402,6 @@ class OverlayWidget(QWidget):
             self.move(x, y)
 
     def show_loading(self):
-        # Phase 5 lock: if the user already has the permissions overlay up,
-        # don't let a model_download_finished or "ready" signal silently
-        # overwrite it. They have to act on the permissions overlay first.
-        if self._mode == "permissions_needed":
-            return
         self._mode = "loading"
         self._status_text = "Loading model..."
         self._substatus_text = "please wait"
@@ -380,21 +411,34 @@ class OverlayWidget(QWidget):
         self.update()
 
     def show_downloading(self):
-        if self._mode == "permissions_needed":
-            return
         self._mode = "downloading"
         self._status_text = "Downloading model"
-        self._substatus_text = "preparing…"
-        self._dl_pct = 0
+        # If a download was already in progress while another mode was
+        # showing (e.g. permissions_needed), use the latest cached numbers.
+        # Otherwise fall back to the placeholder "preparing…".
+        if self._dl_mb_total > 0:
+            self._substatus_text = f"{self._dl_pct}%  {self._dl_mb_done} / {self._dl_mb_total} MB"
+        elif self._dl_mb_done > 0:
+            self._substatus_text = f"{self._dl_mb_done} MB"
+        else:
+            self._substatus_text = "preparing…"
+            self._dl_pct = 0
         self._move_to_position()
         self.show()
         self.raise_()
         self.update()
 
     def update_download_progress(self, pct: int, mb_done: int, mb_total: int):
+        # Always store latest numbers, even if we're not currently in
+        # downloading mode (e.g. permissions_needed overlay is up while
+        # download proceeds in the background). When the overlay later
+        # transitions to downloading via show_downloading(), it picks
+        # up these stored numbers instead of stale "preparing…".
+        self._dl_pct = pct
+        self._dl_mb_done = mb_done
+        self._dl_mb_total = mb_total
         if self._mode != "downloading":
             return
-        self._dl_pct = pct
         if mb_total > 0:
             self._substatus_text = f"{pct}%  {mb_done} / {mb_total} MB"
         else:
@@ -453,7 +497,15 @@ class OverlayWidget(QWidget):
         self._perm_acc = acc_ok
         self._perm_im = im_ok
         self._status_text = "Permissions required"
-        self._substatus_text = "click to open Settings"
+        # Substring tells the user what the click does. With both perms
+        # missing or only IM missing, the click opens the relevant
+        # Settings pane. Once IM is granted and only A is missing, the
+        # click triggers a Tellar restart instead — AXIsProcessTrusted's
+        # per-process cache won't see the A toggle until we restart.
+        if im_ok and not acc_ok:
+            self._substatus_text = "click to restart Tellar"
+        else:
+            self._substatus_text = "click to open Settings"
         self._spin_timer.stop()
         # Cursor is managed dynamically by mouseMoveEvent — pointer only
         # when hovering the substring text, default arrow elsewhere.
@@ -486,6 +538,11 @@ class TellarApp:
         # at runtime (poll loop notices, starts the thread without a
         # full app relaunch).
         self.listener = None
+        # Idempotency flag for the model preload thread — main() may try
+        # to start it at startup (if permissions are already OK) or the
+        # poll loop tries when permissions land at runtime; whoever fires
+        # first wins, the second call is a no-op.
+        self._preload_started = False
         # Polls _check_permissions while the permissions_needed overlay
         # is up. macOS doesn't notify apps about TCC changes, so we have
         # to ask repeatedly. 1.5s interval feels responsive without
@@ -517,6 +574,8 @@ class TellarApp:
     def on_model_ready(self):
         self._ready = True
         self.menubar.set_icon_pixmap(_make_wave_pixmap("#ffffff"))
+        self.menubar.set_status_text("")
+        self.menubar.set_menu_busy(False)
         # Don't override the permissions_needed overlay — model loading
         # finishing in the background doesn't fix a missing permission;
         # the user still has to act on that overlay first.
@@ -525,25 +584,92 @@ class TellarApp:
         self.menubar.set_record_action_enabled(True)
         self.menubar.set_record_action_text("Start Recording  (⌃Space)")
 
+    def show_loading_state(self):
+        """Coordinate overlay + menubar for the model-loading phase.
+        Used both at startup (when permissions are already OK and the
+        model is cached) and from the runtime perm-recheck path."""
+        self.overlay.show_loading()
+        self.menubar.set_status_text("Loading model…")
+        self.menubar.set_menu_busy(True)
+
+    def show_downloading_state(self):
+        """Coordinate overlay + menubar for the model-download phase.
+        Sets a placeholder status text — actual progress percentages
+        arrive via on_download_progress as the download proceeds."""
+        self.overlay.show_downloading()
+        self.menubar.set_status_text("Downloading model…")
+        self.menubar.set_menu_busy(True)
+
+    def on_download_progress(self, pct: int, mb_done: int, mb_total: int):
+        self.overlay.update_download_progress(pct, mb_done, mb_total)
+        if mb_total > 0:
+            self.menubar.set_status_text(
+                f"Downloading model: {pct}%  {mb_done} / {mb_total} MB"
+            )
+        elif mb_done > 0:
+            self.menubar.set_status_text(f"Downloading model: {mb_done} MB")
+        else:
+            self.menubar.set_status_text("Downloading model…")
+        self.menubar.set_menu_busy(True)
+
+    def on_download_finished(self):
+        # Download bytes done → mlx_whisper.load_model now reads them
+        # off disk into MX arrays. That's another tens-of-seconds wait,
+        # so transition the UI from progress bar to "loading…".
+        self.overlay.show_loading()
+        self.menubar.set_status_text("Loading model…")
+        self.menubar.set_menu_busy(True)
+
     def on_permissions_needed(self, acc_ok: bool, im_ok: bool):
         """Show the permissions overlay and start polling so the UI
         reflects the user's grants in real time. When both are granted
-        we can spin up the hotkey listener without a full app restart."""
+        we can spin up the hotkey listener without a full app restart.
+
+        Also auto-open the first missing Settings pane — saves the user
+        a click on the overlay and gets them to the toggle immediately.
+        """
         self.overlay.show_permissions_needed(acc_ok, im_ok)
+        # Surface the same state in the menu — Restart stays enabled here
+        # because it's actively useful while permissions are being granted.
+        self.menubar.set_status_text("Permissions required")
+        self.menubar.set_menu_busy(False)
+        if not im_ok:
+            _open_input_monitoring_settings()
+        elif not acc_ok:
+            _open_accessibility_settings()
         if not self._perm_poll_timer.isActive():
             self._perm_poll_timer.start()
 
     def _perm_recheck(self):
         acc_ok, im_ok = _check_permissions()
         if acc_ok and im_ok:
-            log.info("Permissions granted via runtime poll; starting hotkey")
+            log.info("Permissions granted via runtime poll; starting hotkey + preload")
             self._perm_poll_timer.stop()
-            self.overlay.hide_overlay()
             self._start_hotkey_thread()
+            self._start_preload_thread()
+            # Don't blindly hide the overlay — model may still be downloading
+            # or loading. Pick the right successor mode so the user keeps
+            # seeing what's happening; previously we hid everything and left
+            # the user staring at a yellow menubar icon with no explanation.
+            if self._ready:
+                self.overlay.hide_overlay()
+                self.menubar.set_status_text("")
+                self.menubar.set_menu_busy(False)
+            elif model_exists():
+                self.show_loading_state()
+            else:
+                self.show_downloading_state()
         elif (acc_ok, im_ok) != (self.overlay._perm_acc, self.overlay._perm_im):
-            # State changed but still missing one — refresh the overlay so
-            # the user sees the ✗ flip to ✓ as soon as they grant.
+            # State advanced (one granted) but still incomplete. Refresh
+            # the overlay's checklist so the ✗ flips to ✓ visibly, AND
+            # auto-open the next missing pane in System Settings — the
+            # user is already there, the pane switches under them, no
+            # roundtrip back to Tellar required.
             self.overlay.show_permissions_needed(acc_ok, im_ok)
+            if not im_ok:
+                _open_input_monitoring_settings()
+            elif not acc_ok:
+                _open_accessibility_settings()
 
     def _start_hotkey_thread(self):
         if self.listener is None:
@@ -554,9 +680,52 @@ class TellarApp:
         ).start()
         log.info("Hotkey listener thread started (runtime)")
 
+    def _start_preload_thread(self):
+        """Spin up the model-preload thread once. Called either at startup
+        (if permissions are already granted) or by _perm_recheck the
+        moment they land. Deferring preload until permissions are sorted
+        keeps the Qt main thread free during the permissions UX phase —
+        without this, the download's Qt-signal storm would crowd out
+        menubar clicks and the permissions poll timer."""
+        if self._preload_started:
+            return
+        self._preload_started = True
+        threading.Thread(target=self._preload_model, daemon=True).start()
+        log.info("Model preload thread started")
+
+    def _preload_model(self):
+        import time
+        t0 = time.time()
+        log.info("Preloading whisper model...")
+
+        download_started = False
+
+        def on_progress(pct, mb_done, mb_total):
+            nonlocal download_started
+            download_started = True
+            self.bridge.model_download_progress.emit(pct, mb_done, mb_total)
+
+        try:
+            get_model(on_download_progress=on_progress)
+            # Only nudge the overlay from "downloading" → "loading" if a
+            # download actually occurred. When the model was already
+            # cached, the overlay never went into downloading mode in
+            # the first place, and emitting here would clobber whatever
+            # state it's in.
+            if download_started:
+                self.bridge.model_download_finished.emit()
+        except Exception as e:
+            log.exception("Model preload failed")
+            self.bridge.model_error.emit(str(e))
+            return
+        log.info("Model preload done in %.2fs", time.time() - t0)
+        self.bridge.model_ready.emit()
+
     def on_model_error(self, message: str):
         log.error("Model load failed: %s", message)
         self.menubar.set_icon_pixmap(_make_wave_pixmap("#cc0000"))
+        self.menubar.set_status_text(f"Model error: {message[:60]}")
+        self.menubar.set_menu_busy(False)
         self.overlay.show_error(message)
         self.menubar.set_record_action_text("Model unavailable")
         self.menubar.set_record_action_enabled(False)
@@ -797,48 +966,14 @@ def main():
     tellar.bridge.transcription_empty.connect(tellar._finish)
     tellar.bridge.model_ready.connect(tellar.on_model_ready)
     tellar.bridge.model_error.connect(tellar.on_model_error)
-    tellar.bridge.model_download_progress.connect(tellar.overlay.update_download_progress)
-    # When download finishes, transition the overlay to "Loading model..." while
-    # mlx_whisper imports and load_model run.
-    tellar.bridge.model_download_finished.connect(tellar.overlay.show_loading)
+    tellar.bridge.model_download_progress.connect(tellar.on_download_progress)
+    tellar.bridge.model_download_finished.connect(tellar.on_download_finished)
     tellar.bridge.permissions_needed.connect(tellar.on_permissions_needed)
 
     if not model_exists():
-        log.info("Whisper model not found locally, will download on preload")
-        tellar.overlay.show_downloading()
+        log.info("Whisper model not found locally, will download once permissions OK")
     else:
         log.info("Whisper model already cached")
-        tellar.overlay.show_loading()
-
-    def preload_model():
-        import time
-        t0 = time.time()
-        log.info("Preloading whisper model...")
-
-        download_started = False
-
-        def on_progress(pct, mb_done, mb_total):
-            nonlocal download_started
-            download_started = True
-            tellar.bridge.model_download_progress.emit(pct, mb_done, mb_total)
-
-        try:
-            get_model(on_download_progress=on_progress)
-            # Only nudge the overlay from "downloading" → "loading" if a
-            # download actually occurred. When the model was already cached,
-            # the overlay never went into downloading mode in the first
-            # place, and emitting here would clobber whatever state it's
-            # in (e.g. permissions_needed shown by Phase 5).
-            if download_started:
-                tellar.bridge.model_download_finished.emit()
-        except Exception as e:
-            log.exception("Model preload failed")
-            tellar.bridge.model_error.emit(str(e))
-            return
-        log.info("Model preload done in %.2fs", time.time() - t0)
-        tellar.bridge.model_ready.emit()
-
-    threading.Thread(target=preload_model, daemon=True).start()
 
     from .hotkey import HotkeyListener
     listener = HotkeyListener(on_toggle=tellar.on_toggle, on_cancel=tellar.on_cancel)
@@ -846,17 +981,30 @@ def main():
     # hotkey thread later if permissions are missing at startup.
     tellar.listener = listener
 
-    # Phase 5: check permissions BEFORE spawning the hotkey thread. If
-    # either Input Monitoring or Accessibility is missing, surface the
-    # overlay immediately and skip the hotkey thread (it would just fail
-    # silently in CGEventTapCreate). The poll loop in TellarApp will
-    # start the thread the moment the user grants both.
+    # Phase 5: check permissions BEFORE doing ANYTHING that could compete
+    # with permissions UX for resources. Specifically — don't start the
+    # model preload thread until permissions are granted. A first-launch
+    # download fires Qt signals from a worker thread frequently enough
+    # that the main thread can't service menubar clicks or the
+    # permissions-poll timer, leaving the user stuck after the first
+    # permission grant. By gating preload on permissions OK, the
+    # permissions phase has the main thread to itself.
     acc_ok, im_ok = _check_permissions()
     log.info("Permissions check: accessibility=%s input_monitoring=%s", acc_ok, im_ok)
-    if not (acc_ok and im_ok):
-        tellar.bridge.permissions_needed.emit(acc_ok, im_ok)
-    else:
+    if acc_ok and im_ok:
+        # All clear — show the model-state overlay, start hotkey, and
+        # kick off the preload thread now.
+        if not model_exists():
+            tellar.show_downloading_state()
+        else:
+            tellar.show_loading_state()
         tellar._start_hotkey_thread()
+        tellar._start_preload_thread()
+    else:
+        # Permissions phase first — preload is deferred. _perm_recheck
+        # in TellarApp starts the preload thread the moment both
+        # permissions land.
+        tellar.bridge.permissions_needed.emit(acc_ok, im_ok)
 
     log.info("Entering Qt event loop")
     sys.exit(app.exec())

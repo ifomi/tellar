@@ -139,6 +139,27 @@ class MenuBarIcon:
         objc.setAssociatedObject(self._item, b"controller", self._controller, 0x301)
 
         menu = NSMenu.alloc().init()
+        # NSMenu's default autoenablesItems=YES re-enables any item whose
+        # target responds to the action selector, overriding our manual
+        # setEnabled_(False). Turn it off so set_menu_busy can actually
+        # grey out Auto Paste / Restart during model download.
+        menu.setAutoenablesItems_(False)
+
+        # Status row at the top — disabled, used to surface what Tellar is
+        # doing right now (downloading model, loading model, permissions
+        # required, ...). Hidden when there's nothing to say. The menu is
+        # the always-available fallback for the user to learn the app's
+        # state, regardless of whether the floating overlay is visible.
+        self._status_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "", "", ""
+        )
+        self._status_item.setEnabled_(False)
+        self._status_item.setHidden_(True)
+        menu.addItem_(self._status_item)
+
+        self._status_separator = NSMenuItem.separatorItem()
+        self._status_separator.setHidden_(True)
+        menu.addItem_(self._status_separator)
 
         self._record_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Start Recording  (⌃Space)", "doToggle:", ""
@@ -203,6 +224,35 @@ class MenuBarIcon:
 
     def set_record_action_enabled(self, enabled: bool):
         self._record_item.setEnabled_(enabled)
+
+    def set_status_text(self, text: str):
+        """Update the disabled status row at the top of the dropdown menu.
+
+        Empty string hides the row (and its separator) so the menu falls
+        back to its compact layout. Non-empty text shows the row — used
+        to surface model download/load progress, permissions state, and
+        any other ambient state the user might want to peek at by
+        clicking the menu bar icon."""
+        log.info("set_status_text: %r", text)
+        if text:
+            self._status_item.setTitle_(text)
+            self._status_item.setHidden_(False)
+            self._status_separator.setHidden_(False)
+        else:
+            self._status_item.setHidden_(True)
+            self._status_separator.setHidden_(True)
+
+    def set_menu_busy(self, busy: bool):
+        """When busy=True, disable everything except About and Quit.
+
+        Used while the model is downloading or loading — the user should
+        not be able to toggle Auto Paste while a long-running operation
+        is in flight. Start Recording is governed by
+        set_record_action_enabled separately (it's tied to model
+        readiness, not just busy state)."""
+        log.info("set_menu_busy: %s", busy)
+        enabled = not busy
+        self._auto_paste_item.setEnabled_(enabled)
 
     def is_auto_paste_enabled(self) -> bool:
         return bool(self._auto_paste_item.state())
