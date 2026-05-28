@@ -79,6 +79,17 @@ class _MenuController(NSObject):
         if fn:
             fn(bool(sender.state()))
 
+    def doEditVocabulary_(self, sender):
+        # Open vocabulary.txt in the user's default text editor. -t asks
+        # macOS to use the default handler for plain text (TextEdit, or
+        # whatever the user has registered for .txt). The file is created
+        # from a commented template if missing so a fresh user always
+        # sees usage instructions inside.
+        import subprocess
+        from .vocabulary import VOCAB_PATH, ensure_file_exists
+        ensure_file_exists()
+        subprocess.Popen(["open", "-t", str(VOCAB_PATH)])
+
     def doAbout_(self, sender):
         # Show a native NSAlert with build info. Version comes from the
         # bundle's CFBundleShortVersionString (no need to thread it through
@@ -176,6 +187,14 @@ class MenuBarIcon:
         self._auto_paste_item.setTarget_(self._controller)
         self._auto_paste_item.setState_(1)
         menu.addItem_(self._auto_paste_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        edit_vocab_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Edit Vocabulary…", "doEditVocabulary:", ""
+        )
+        edit_vocab_item.setTarget_(self._controller)
+        menu.addItem_(edit_vocab_item)
 
         menu.addItem_(NSMenuItem.separatorItem())
 

@@ -8,6 +8,7 @@ import numpy as np
 
 from .hallucinations import remove_hallucinations
 from .logging_setup import get_logger
+from .vocabulary import format_vocabulary_suffix
 
 log = get_logger(__name__)
 
@@ -235,6 +236,23 @@ PUNCTUATION_PROMPT = (
     "Hello, how are you? Today is a great day."
 )
 
+
+def _with_vocabulary(base_prompt: str) -> str:
+    """Append the user's custom-vocabulary suffix to a base prompt when
+    the vocabulary file has any entries. Empty vocabulary → base prompt
+    is returned unchanged. Used at every code path that constructs a
+    fresh whisper initial_prompt (i.e. PUNCTUATION_PROMPT-based) — not
+    on the chunked-pipeline rolling prompt, which has its own meaningful
+    context and shouldn't be diluted by the vocab list.
+
+    The vocab file is re-read on every call (cheap, < 1ms for typical
+    sizes). That keeps the user's edits visible at the very next
+    transcription without any cache-invalidation logic."""
+    suffix = format_vocabulary_suffix()
+    if not suffix:
+        return base_prompt
+    return f"{base_prompt} {suffix}"
+
 _model_loaded = False
 
 # (pct, mb_done, mb_total)
@@ -415,7 +433,7 @@ def transcribe_audio(audio_path: str) -> str:
     result = mlx_whisper.transcribe(
         audio,
         path_or_hf_repo=MODEL_NAME,
-        initial_prompt=PUNCTUATION_PROMPT,
+        initial_prompt=_with_vocabulary(PUNCTUATION_PROMPT),
         no_speech_threshold=0.5,
         compression_ratio_threshold=2.0,
     )
@@ -475,7 +493,12 @@ def transcribe_chunk(audio: np.ndarray, initial_prompt: Optional[str] = None) ->
         return ""
     _set_hf_offline(True)
     import mlx_whisper
-    prompt = initial_prompt if initial_prompt else PUNCTUATION_PROMPT
+    # Rolling prompt (chunks 1+ with clean handoff) is passed through
+    # untouched — vocab would compete with meaningful per-chunk context
+    # for the ~224-token prompt budget. Vocab attaches only to the
+    # PUNCTUATION_PROMPT default path: chunk 0, and chunks 1+ where the
+    # previous chunk ended without a clean terminator (rolling reset).
+    prompt = initial_prompt if initial_prompt else _with_vocabulary(PUNCTUATION_PROMPT)
     result = mlx_whisper.transcribe(
         audio,
         path_or_hf_repo=MODEL_NAME,

@@ -1026,6 +1026,13 @@ def main():
 
     setup_logging()
 
+    # Make sure the user's vocabulary file exists with the commented
+    # template before the menubar's "Edit Vocabulary…" can be clicked
+    # — and before the first transcription tries to read it. Idempotent
+    # on subsequent launches.
+    from .vocabulary import ensure_file_exists as _ensure_vocab_file
+    _ensure_vocab_file()
+
     # Diagnostic: what does macOS think this process is?
     try:
         from Foundation import NSBundle
