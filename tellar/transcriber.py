@@ -6,6 +6,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from .hallucinations import remove_hallucinations
 from .logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -189,7 +190,19 @@ CHUNKED_TRANSCRIPTION = True
 #                        that case. Doesn't change chunking, doesn't
 #                        change whisper params — just smarter prompt
 #                        handoff. Minimal change over best-known v8.
-TRANSCRIPTION_VARIANT = "chunked_rolling_v11_smart_prompt_no_vad"
+#   chunked_rolling_v12_hallucination_filter —
+#                        v11 + post-hoc filter for known whisper
+#                        hallucinations (tellar/hallucinations.py).
+#                        Targets phrases the model emits when it
+#                        interprets audio as end-of-segment markers
+#                        — "Продолжение следует...", "DimaTorzok"
+#                        subtitle attribution, English channel
+#                        sign-offs etc. — REPLACING real content
+#                        with these phrases. Hand-curated blocklist,
+#                        applied after clean_hallucinations on every
+#                        transcribe path (chunks + chunked-assembly +
+#                        full-WAV fallback + flag-off path).
+TRANSCRIPTION_VARIANT = "chunked_rolling_v12_hallucination_filter"
 
 # Variant tag used by app.py when CHUNKED_TRANSCRIPTION=False, i.e. when
 # the entire chunked pipeline is bypassed and transcribe_audio() is
@@ -407,7 +420,7 @@ def transcribe_audio(audio_path: str) -> str:
         compression_ratio_threshold=2.0,
     )
     text = result.get("text", "").strip()
-    return clean_hallucinations(text)
+    return remove_hallucinations(clean_hallucinations(text))
 
 
 def transcribe_audio_defaults(audio_path: str) -> str:
@@ -434,7 +447,7 @@ def transcribe_audio_defaults(audio_path: str) -> str:
     audio = _load_wav_mono16k(audio_path)
     result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL_NAME)
     text = result.get("text", "").strip()
-    return clean_hallucinations(text)
+    return remove_hallucinations(clean_hallucinations(text))
 
 
 def transcribe_chunk(audio: np.ndarray, initial_prompt: Optional[str] = None) -> str:
@@ -478,4 +491,4 @@ def transcribe_chunk(audio: np.ndarray, initial_prompt: Optional[str] = None) ->
         compression_ratio_threshold=2.4,
     )
     text = result.get("text", "").strip()
-    return clean_hallucinations(text)
+    return remove_hallucinations(clean_hallucinations(text))

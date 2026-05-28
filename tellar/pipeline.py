@@ -56,6 +56,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .chunking import ChunkingBuffer, TARGET_RATE
+from .hallucinations import remove_hallucinations
 from .recorder import Recorder
 from .transcriber import transcribe_audio_defaults, transcribe_chunk, clean_hallucinations
 from .logging_setup import get_logger
@@ -247,7 +248,7 @@ class TranscriptionPipeline:
                 log.info("Pipeline finalize: assembled from %d chunks (%d chars)",
                          self._chunk_idx, len(joined))
                 self._finalize_path = "assembled"
-                return clean_hallucinations(joined)
+                return remove_hallucinations(clean_hallucinations(joined))
 
         log.info("Pipeline finalize: using fallback transcribe_audio_defaults")
         self._last_fallback_used = True
