@@ -14,7 +14,8 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QPen
 from typing import Optional
 
 from .recorder import Recorder
-from .transcriber import transcribe_audio, model_exists, get_model, MODEL_DIR, MODEL_NAME
+from .transcriber import transcribe_audio, model_exists, get_model, MODEL_DIR, MODEL_NAME, CHUNKED_TRANSCRIPTION, TRANSCRIPTION_VARIANT, BASELINE_VARIANT
+from .pipeline import TranscriptionPipeline
 from .inserter import insert_text, get_frontmost_app
 from .logging_setup import setup_logging, get_logger
 from .menubar import MenuBarIcon
@@ -25,6 +26,25 @@ WAVEFORM_BARS = 5
 MAX_AMPLITUDE = 1000.0
 STATE_DIR = Path.home() / "Library" / "Application Support" / "Tellar"
 POSITION_FILE = STATE_DIR / "overlay_position.json"
+# Append-only JSONL log of every successful transcription. Each line:
+# {ts, audio_sec, transcribe_sec, chars, since_startup_sec, first_after_warmup}.
+# Used for offline analysis to decide whether chunked transcription is worth
+# the architectural complexity. Temporary instrumentation — to be removed
+# once benchmark dataset is collected.
+#
+# The writer picks one of two files based on CHUNKED_TRANSCRIPTION at
+# write time: baseline file collects pre-chunked behavior, chunked file
+# collects post-migration behavior. Mixing them in one log makes A/B
+# comparison — especially on long recordings, which is the whole point
+# of this work — impossible to reconstruct after the fact.
+TRANSCRIPTION_LOG_BASELINE = STATE_DIR / "transcription_log.jsonl"
+TRANSCRIPTION_LOG_CHUNKED = STATE_DIR / "transcription_log_chunked.jsonl"
+# When TELLAR_SAVE_WAVS=1 in the env, every recorded WAV is copied here
+# before cleanup. Used to capture matched A/B pairs (same audio →
+# old vs new transcription) for chunked-transcription quality validation.
+# Once chunked path goes live we lose the ability to gather these pairs,
+# so we collect them now during the migration window.
+SAMPLES_DIR = STATE_DIR / "samples"
 
 
 # Path to the brand silhouette used as the menubar icon. The PNG is a
@@ -524,6 +544,11 @@ class OverlayWidget(QWidget):
 class TellarApp:
     def __init__(self, menubar):
         self.recorder = Recorder()
+        # Owned alongside the recorder regardless of CHUNKED_TRANSCRIPTION.
+        # Cheap to instantiate; only exercised when the flag is on. Phase 2+
+        # will route start/stop/cancel through the pipeline; Phase 1 keeps
+        # the flag-off path on the original direct-recorder code.
+        self.pipeline = TranscriptionPipeline(self.recorder)
         self.bridge = Bridge()
         self.overlay = OverlayWidget()
         self.menubar = menubar
@@ -543,6 +568,12 @@ class TellarApp:
         # poll loop tries when permissions land at runtime; whoever fires
         # first wins, the second call is a no-op.
         self._preload_started = False
+        # Instrumentation for chunked-transcription feasibility study.
+        # _app_start_time anchors `since_startup_sec` in transcription_log
+        # so we can later filter cold-JIT outliers (first 1-2 transcriptions
+        # tend to be slower despite white-noise warmup).
+        self._app_start_time = datetime.now().timestamp()
+        self._transcribe_count = 0
         # Polls _check_permissions while the permissions_needed overlay
         # is up. macOS doesn't notify apps about TCC changes, so we have
         # to ask repeatedly. 1.5s interval feels responsive without
@@ -762,8 +793,11 @@ class TellarApp:
 
     def _cancel_recording(self):
         self._timer.stop()
-        self.recorder.stop()
-        self.recorder.cleanup()
+        if CHUNKED_TRANSCRIPTION:
+            self.pipeline.cancel()
+        else:
+            self.recorder.stop()
+            self.recorder.cleanup()
         self._target_app = None
         self.overlay.hide_overlay()
         self.menubar.set_icon_pixmap(_make_wave_pixmap("#ffffff"))
@@ -774,7 +808,10 @@ class TellarApp:
         target_bundle = self._target_app.bundleIdentifier() if self._target_app else None
         log.info("Recording started, target app: %s", target_bundle)
         self._record_start = datetime.now()
-        self.recorder.start()
+        if CHUNKED_TRANSCRIPTION:
+            self.pipeline.start()
+        else:
+            self.recorder.start()
         self.overlay.show_recording("0:00")
         self.menubar.set_icon_title("0:00")
         self.menubar.set_record_action_text("Stop Recording  (⌃Space)")
@@ -787,7 +824,10 @@ class TellarApp:
 
         elapsed = (datetime.now() - self._record_start).total_seconds() if self._record_start else 0
         log.info("Recording stopped after %.1fs", elapsed)
-        wav_path = self.recorder.stop()
+        if CHUNKED_TRANSCRIPTION:
+            wav_path = self.pipeline.stop_capture()
+        else:
+            wav_path = self.recorder.stop()
         if not wav_path:
             log.info("WAV empty (silence trimmed below threshold), aborting transcription")
             self.overlay.hide_overlay()
@@ -805,10 +845,27 @@ class TellarApp:
             import time
             t0 = time.time()
             try:
-                text = transcribe_audio(wav_path)
+                if CHUNKED_TRANSCRIPTION:
+                    text = self.pipeline.finalize()
+                else:
+                    text = transcribe_audio(wav_path)
                 duration = time.time() - t0
                 log.info("Transcription done in %.2fs, %d chars", duration, len(text))
-                self.recorder.cleanup()
+                try:
+                    self._append_transcription_log(wav_path, duration, len(text))
+                except Exception:
+                    log.exception("transcription_log append failed")
+                if os.environ.get("TELLAR_SAVE_WAVS") == "1" or (
+                    CHUNKED_TRANSCRIPTION and self.pipeline.last_fallback_used
+                ):
+                    try:
+                        self._save_sample_wav(wav_path)
+                    except Exception:
+                        log.exception("sample WAV save failed")
+                if CHUNKED_TRANSCRIPTION:
+                    self.pipeline.cleanup()
+                else:
+                    self.recorder.cleanup()
                 if text.strip():
                     self.bridge.transcription_done.emit(text.strip())
                 else:
@@ -819,6 +876,58 @@ class TellarApp:
                 self.bridge.transcription_empty.emit()
 
         threading.Thread(target=process, daemon=True).start()
+
+    def _append_transcription_log(self, wav_path: str, transcribe_sec: float, chars: int):
+        """Append one JSONL row capturing the (audio_duration, transcribe_duration)
+        pair for offline analysis. POSIX append() of a sub-PIPE_BUF line is
+        atomic, so concurrent writes from sequential _stop_recording calls
+        don't need a lock. Failure here must not break the user-visible
+        transcription flow — caller wraps in try/except.
+        """
+        import json
+        import time
+        import wave
+        from datetime import datetime
+        with wave.open(wav_path, "rb") as wf:
+            audio_sec = wf.getnframes() / wf.getframerate()
+        self._transcribe_count += 1
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "audio_sec": round(audio_sec, 2),
+            "transcribe_sec": round(transcribe_sec, 3),
+            "chars": chars,
+            "since_startup_sec": round(time.time() - self._app_start_time, 1),
+            "first_after_warmup": self._transcribe_count == 1,
+            "variant": TRANSCRIPTION_VARIANT if CHUNKED_TRANSCRIPTION else BASELINE_VARIANT,
+        }
+        # Merge pipeline diagnostics when chunked path was used.
+        # last_run_stats is meaningful only after pipeline.finalize() —
+        # silent on flag-off path.
+        if CHUNKED_TRANSCRIPTION:
+            try:
+                record.update(self.pipeline.last_run_stats)
+            except Exception:
+                log.exception("could not collect pipeline stats")
+        log_path = TRANSCRIPTION_LOG_CHUNKED if CHUNKED_TRANSCRIPTION else TRANSCRIPTION_LOG_BASELINE
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _save_sample_wav(self, wav_path: str):
+        """Copy the just-recorded WAV into SAMPLES_DIR for later A/B baseline
+        replay. Called only when TELLAR_SAVE_WAVS=1. Filename encodes the
+        unix timestamp and audio duration so we can pick out long samples
+        for chunked-transcription validation. Caller wraps in try/except.
+        """
+        import shutil
+        import time
+        import wave
+        with wave.open(wav_path, "rb") as wf:
+            audio_sec = wf.getnframes() / wf.getframerate()
+        SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+        dest = SAMPLES_DIR / f"sample_{int(time.time())}_{int(round(audio_sec))}s.wav"
+        shutil.copyfile(wav_path, dest)
+        log.info("Saved sample WAV: %s", dest)
 
     def _insert_result(self, text):
         self._recording = False

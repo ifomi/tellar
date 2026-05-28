@@ -5,6 +5,7 @@ import threading
 import struct
 import audioop
 from pathlib import Path
+from typing import Callable, Optional
 
 from .logging_setup import get_logger
 
@@ -13,6 +14,11 @@ log = get_logger(__name__)
 SILENCE_THRESHOLD = 500
 MIN_SPEECH_CHUNKS = 3
 TARGET_RATE = 16000
+
+# Per-frame callback signature: (frame_bytes, source_rate). Source rate is
+# passed because it's only known after the device is probed inside start();
+# the consumer (chunking pipeline) needs it to construct its resampler.
+FrameCallback = Callable[[bytes, int], None]
 
 
 class Recorder:
@@ -26,16 +32,18 @@ class Recorder:
         self._device_rate = TARGET_RATE
         self.channels = 1
         self.chunk = 1024
+        self._frame_callback: Optional[FrameCallback] = None
 
     def _find_input_device(self):
         info = self._pa.get_default_input_device_info()
         return int(info['index']), int(info['defaultSampleRate'])
 
-    def start(self):
+    def start(self, frame_callback: Optional[FrameCallback] = None):
         if self.is_recording:
             return
         self.is_recording = True
         self._frames = []
+        self._frame_callback = frame_callback
         self._pa = pyaudio.PyAudio()
         dev_index, self._device_rate = self._find_input_device()
         try:
@@ -60,6 +68,13 @@ class Recorder:
             try:
                 data = self._stream.read(self.chunk, exception_on_overflow=False)
                 self._frames.append(data)
+                if self._frame_callback is not None:
+                    try:
+                        self._frame_callback(data, self._device_rate)
+                    except Exception:
+                        # A buggy callback must not kill capture — fallback
+                        # path needs the WAV to keep accumulating.
+                        log.exception("frame_callback raised")
                 samples = struct.unpack(f"<{len(data)//2}h", data)
                 self._amplitude = (sum(s * s for s in samples) / len(samples)) ** 0.5
             except Exception:
