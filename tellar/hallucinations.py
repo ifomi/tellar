@@ -33,6 +33,7 @@ HALLUCINATION_PHRASES = [
     # Russian — series/segment end markers
     "Продолжение следует",
     "Продолжение в следующей серии",
+    "Смотрите продолжение в следующей серии",
     "Конец фильма",
     "Конец первой серии",
     # Russian — subtitle attribution that whisper sometimes inserts
