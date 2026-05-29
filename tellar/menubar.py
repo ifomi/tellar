@@ -79,6 +79,20 @@ class _MenuController(NSObject):
         if fn:
             fn(bool(sender.state()))
 
+    def doToggleStudio_(self, sender):
+        new_state = 0 if sender.state() else 1
+        sender.setState_(new_state)
+        enabled = bool(new_state)
+        # Studio takes precedence over Auto Paste: while Studio is on, the
+        # dictation goes to the Studio window and Auto Paste is meaningless,
+        # so grey it out. Its checkmark is left untouched — turning Studio
+        # back off restores whatever Auto Paste state the user had.
+        if self._auto_paste_item is not None:
+            self._auto_paste_item.setEnabled_(not enabled)
+        fn = self._cb.get("studio_changed")
+        if fn:
+            fn(enabled)
+
     def doEditVocabulary_(self, sender):
         # Open vocabulary.txt in the user's default text editor. -t asks
         # macOS to use the default handler for plain text (TextEdit, or
@@ -131,6 +145,7 @@ class MenuBarIcon:
 
     def __init__(self, on_toggle: Callable[[], None],
                  on_auto_paste_changed: Optional[Callable[[bool], None]] = None,
+                 on_studio_changed: Optional[Callable[[bool], None]] = None,
                  model_name: str = "?"):
         self._bar = NSStatusBar.systemStatusBar()
         # Variable length so the item resizes to fit a wide title (e.g. "0:01"
@@ -144,6 +159,7 @@ class MenuBarIcon:
         self._controller = _MenuController.alloc().initWithCallbacks_({
             "toggle": on_toggle,
             "auto_paste_changed": on_auto_paste_changed,
+            "studio_changed": on_studio_changed,
             "model_name": model_name,
         })
         # Keep strong reference so ARC doesn't deallocate
@@ -187,6 +203,16 @@ class MenuBarIcon:
         self._auto_paste_item.setTarget_(self._controller)
         self._auto_paste_item.setState_(1)
         menu.addItem_(self._auto_paste_item)
+
+        self._studio_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Dictate to Studio", "doToggleStudio:", ""
+        )
+        self._studio_item.setTarget_(self._controller)
+        self._studio_item.setState_(0)
+        menu.addItem_(self._studio_item)
+        # Let the controller reach Auto Paste so toggling Studio can grey it
+        # out (Studio overrides it). _MenuController initialised it to None.
+        self._controller._auto_paste_item = self._auto_paste_item
 
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -271,7 +297,24 @@ class MenuBarIcon:
         readiness, not just busy state)."""
         log.info("set_menu_busy: %s", busy)
         enabled = not busy
+        # Studio overrides Auto Paste — never re-enable it while Studio is on,
+        # even when a long-running operation finishes.
+        if enabled and self.is_studio_enabled():
+            enabled = False
         self._auto_paste_item.setEnabled_(enabled)
 
     def is_auto_paste_enabled(self) -> bool:
         return bool(self._auto_paste_item.state())
+
+    def is_studio_enabled(self) -> bool:
+        return bool(self._studio_item.state())
+
+    def set_studio_enabled(self, enabled: bool):
+        """Sync the Studio menu checkmark and Auto Paste enablement to match
+        the window's actual state. Used when the window is closed by its title
+        bar — there's no menu click to flip the state, so the app calls this.
+        Does NOT invoke the studio_changed callback (it's a UI sync, not a
+        user-initiated toggle), avoiding a show/hide feedback loop."""
+        self._studio_item.setState_(1 if enabled else 0)
+        if self._auto_paste_item is not None:
+            self._auto_paste_item.setEnabled_(not enabled)

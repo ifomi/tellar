@@ -19,6 +19,7 @@ from .pipeline import TranscriptionPipeline
 from .inserter import insert_text, get_frontmost_app
 from .logging_setup import setup_logging, get_logger
 from .menubar import MenuBarIcon
+from .studio import StudioWindow
 
 log = get_logger(__name__)
 
@@ -502,6 +503,13 @@ class OverlayWidget(QWidget):
         self._spin_timer.stop()
         self.update()
 
+    def show_studio_sent(self):
+        self._mode = "done"
+        self._status_text = "Sent to Studio"
+        self._substatus_text = ""
+        self._spin_timer.stop()
+        self.update()
+
     def show_error(self, message: str):
         self._mode = "error"
         self._status_text = "Model failed"
@@ -551,6 +559,11 @@ class TellarApp:
         self.pipeline = TranscriptionPipeline(self.recorder)
         self.bridge = Bridge()
         self.overlay = OverlayWidget()
+        self.studio = StudioWindow()
+        # Closing the Studio window is equivalent to turning Studio off —
+        # visibility is coupled to routing (there's no other use for an open
+        # window in Phase 1). The handler syncs the menu + Auto Paste.
+        self.studio.on_close = self._on_studio_window_closed
         self.menubar = menubar
         self._recording = False
         self._ready = False
@@ -816,6 +829,10 @@ class TellarApp:
         self.menubar.set_icon_title("0:00")
         self.menubar.set_record_action_text("Stop Recording  (⌃Space)")
         self._timer.start()
+        # In Studio mode, surface the Studio window now so it's visually clear
+        # the dictation will land there (not in the active app) on stop.
+        if self.menubar.is_studio_enabled():
+            self.studio.show_panel()
 
     def _stop_recording(self):
         self._timer.stop()
@@ -931,6 +948,12 @@ class TellarApp:
 
     def _insert_result(self, text):
         self._recording = False
+        # Studio mode overrides Auto Paste: the text goes into the Studio
+        # window for editing instead of being pasted/copied anywhere. The
+        # clipboard is left alone until the user hits Copy inside Studio.
+        if self.menubar.is_studio_enabled():
+            self._route_to_studio(text)
+            return
         auto_paste = self.menubar.is_auto_paste_enabled()
         try:
             pasted = insert_text(text, self._target_app, auto_paste)
@@ -946,6 +969,40 @@ class TellarApp:
         self._target_app = None
         self.menubar.set_icon_pixmap(_make_wave_pixmap("#00cc66"))
         QTimer.singleShot(1500, self._finish)
+
+    def _route_to_studio(self, text):
+        """Send a finished transcription to the Studio window instead of the
+        active app. The window is already up (shown at recording start) but
+        show_panel is idempotent and re-raises it just in case."""
+        try:
+            self.studio.show_panel()
+            self.studio.append_dictation(text)
+            log.info("Routed %d chars to Studio", len(text))
+            self.overlay.show_studio_sent()
+        except Exception:
+            log.exception("Studio routing error")
+            self.overlay.show_copied()
+        self._target_app = None
+        self.menubar.set_icon_pixmap(_make_wave_pixmap("#00cc66"))
+        QTimer.singleShot(1500, self._finish)
+
+    def on_studio_changed(self, enabled: bool):
+        """Menu callback when the Studio toggle flips. Visibility is coupled to
+        routing: enabling shows the window (where dictations will land),
+        disabling hides it. Hiding preserves the editor content for next time."""
+        log.info("Studio mode toggled: %s", enabled)
+        if enabled:
+            self.studio.show_panel()
+        else:
+            self.studio.hide()
+
+    def _on_studio_window_closed(self):
+        """The user closed the Studio window via its title bar. Treat it as
+        turning Studio off: uncheck the menu item and re-enable Auto Paste.
+        set_studio_enabled doesn't re-trigger on_studio_changed, so this won't
+        loop back into hide()."""
+        log.info("Studio window closed by user; disabling Studio routing")
+        self.menubar.set_studio_enabled(False)
 
     def _finish(self):
         self.overlay.hide_overlay()
@@ -1061,18 +1118,28 @@ def main():
     # before Qt takes over. The on_toggle callback is wired up via a holder
     # because TellarApp doesn't exist yet.
     _toggle_holder = [None]
+    _studio_holder = [None]
     menubar = MenuBarIcon(
         on_toggle=lambda: _toggle_holder[0]() if _toggle_holder[0] else None,
+        on_studio_changed=lambda enabled: _studio_holder[0](enabled) if _studio_holder[0] else None,
         model_name=MODEL_NAME,
     )
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    # QApplication promotes the process to a Regular (Dock-showing) app, and it
+    # does so when the event loop starts — so a call right here would be
+    # overwritten. Defer the accessory re-assert into the loop via a 0ms timer
+    # so it runs AFTER Qt has set its policy. In the bundle LSUIElement=true
+    # already handles this; it only matters when running from source (.venv),
+    # where there's no LSUIElement to rely on.
+    QTimer.singleShot(0, _set_accessory_policy)
     app.aboutToQuit.connect(_release_lock)
     app.aboutToQuit.connect(lambda: log.info("Tellar exiting"))
 
     tellar = TellarApp(menubar)
     _toggle_holder[0] = tellar.on_toggle
+    _studio_holder[0] = tellar.on_studio_changed
     tellar.attach_menubar()
 
     tellar.bridge.recording_started.connect(tellar._start_recording)
