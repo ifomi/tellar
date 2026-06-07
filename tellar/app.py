@@ -19,6 +19,7 @@ from .pipeline import TranscriptionPipeline
 from .inserter import insert_text, get_frontmost_app
 from .logging_setup import setup_logging, get_logger
 from .menubar import MenuBarIcon
+from . import studio_llm
 from .studio import StudioWindow
 
 log = get_logger(__name__)
@@ -740,7 +741,7 @@ class TellarApp:
     def _preload_model(self):
         import time
         t0 = time.time()
-        log.info("Preloading whisper model...")
+        log.info("Preloading models (whisper + studio LLM)...")
 
         download_started = False
 
@@ -751,17 +752,26 @@ class TellarApp:
 
         try:
             get_model(on_download_progress=on_progress)
-            # Only nudge the overlay from "downloading" → "loading" if a
-            # download actually occurred. When the model was already
-            # cached, the overlay never went into downloading mode in
-            # the first place, and emitting here would clobber whatever
-            # state it's in.
-            if download_started:
-                self.bridge.model_download_finished.emit()
         except Exception as e:
-            log.exception("Model preload failed")
+            log.exception("Whisper model preload failed")
             self.bridge.model_error.emit(str(e))
             return
+
+        # Studio LLM preload — mirrors the whisper flow and shares the same
+        # progress relay, so a fresh install shows both models downloading
+        # (two models now instead of one). A failure here must NOT mark the
+        # app broken: dictation still works, only Studio transforms would be
+        # unavailable.
+        try:
+            studio_llm.get_model(on_download_progress=on_progress)
+        except Exception:
+            log.exception("Studio LLM preload failed (Studio transforms disabled)")
+
+        # Nudge the overlay "downloading" → "loading"/ready only if a download
+        # actually happened (across either model); when both were cached the
+        # overlay never entered downloading mode.
+        if download_started:
+            self.bridge.model_download_finished.emit()
         log.info("Model preload done in %.2fs", time.time() - t0)
         self.bridge.model_ready.emit()
 
