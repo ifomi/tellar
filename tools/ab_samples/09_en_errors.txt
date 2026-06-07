@@ -1,0 +1,1 @@
+I wanted to tell you about problem with yesterday's deploy. It was failed because we didn't have access to the database, and now I am waiting answer from devops team since morning. Also just for your information, this is already second time when this happens — last week we had similar issue with staging environment, but back then we resolved it quickly by ourselves.

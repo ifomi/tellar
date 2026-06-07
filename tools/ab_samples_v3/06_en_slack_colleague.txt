@@ -1,0 +1,1 @@
+Hey, found a weird thing in chart-store. When you switch between dashboards quickly the state sometimes gets lost. Hard to reproduce but if you click tabs back and forth for like twenty seconds you usually catch it. Can you take a look at the PR I just pushed, the fix is simple but I want a second opinion before merge.

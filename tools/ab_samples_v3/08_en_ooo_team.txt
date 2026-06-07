@@ -1,0 +1,1 @@
+Hey team. Next week I am on vacation from Wednesday to Monday, back Tuesday. For urgent matters please reach Andrey, he knows the status of my tasks. If something breaks in production give me a call directly, I will have my phone but might take a while to respond. Before vacation I will try to close the filter PR and leave comments in open tickets.

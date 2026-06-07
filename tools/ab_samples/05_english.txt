@@ -1,0 +1,1 @@
+So, um, I was thinking. Like maybe we should, you know, refactor the the chart store. Because it's getting kind of messy and uh hard to test I mean really hard.
