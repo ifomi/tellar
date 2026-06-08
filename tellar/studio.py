@@ -48,12 +48,14 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QTextEdit,
+    QPlainTextEdit,
     QPushButton,
     QApplication,
     QSplitter,
 )
 
 import threading
+from pathlib import Path
 
 from . import studio_llm
 from .logging_setup import get_logger
@@ -100,6 +102,51 @@ QTextEdit {
     padding: 6px;
 }
 """
+
+# Same border for the Custom prompt input (a QPlainTextEdit, not QTextEdit) so
+# both fields visually match.
+_PROMPT_QSS = """
+QPlainTextEdit {
+    border: 1px solid #d0d0d0;
+    border-radius: 6px;
+    background: #ffffff;
+    padding: 6px;
+}
+"""
+
+# Custom prompt history — bash-style recall of past instructions on ↑/↓.
+# Lives outside the bundle so it survives rebuilds (same convention as
+# vocabulary.txt and the transcription log).
+CUSTOM_HISTORY_FILE = (
+    Path.home() / "Library" / "Application Support" / "Tellar"
+    / "custom_prompts_history.txt"
+)
+# Cap the history so it stays a useful "last few" stack rather than an
+# archive — older entries silently fall off as new ones are added.
+CUSTOM_HISTORY_CAP = 5
+
+
+def _load_custom_history() -> list[str]:
+    """Read persisted Custom prompts (newest first). Missing file → empty."""
+    try:
+        with open(CUSTOM_HISTORY_FILE, encoding="utf-8") as f:
+            return [line.rstrip("\n") for line in f if line.rstrip("\n")]
+    except FileNotFoundError:
+        return []
+    except Exception:
+        log.exception("Failed to read Custom history")
+        return []
+
+
+def _save_custom_history(entries: list[str]):
+    """Write the history (newest first) capped at CUSTOM_HISTORY_CAP."""
+    try:
+        CUSTOM_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CUSTOM_HISTORY_FILE, "w", encoding="utf-8") as f:
+            for line in entries[:CUSTOM_HISTORY_CAP]:
+                f.write(line + "\n")
+    except Exception:
+        log.exception("Failed to save Custom history")
 
 
 def sf_icon(name: str) -> QIcon | None:
@@ -403,6 +450,20 @@ class _EditorPane(QWidget):
         layout.setSpacing(FRAME_MARGIN)
         layout.addWidget(self.editor, 1)
         layout.addLayout(strip)
+
+        # Set the pane's minimum height to what the button strip ACTUALLY
+        # needs (each fixed-size button + 4px spacing between them) so the
+        # QSplitter can't squeeze the bottom pane — which has more buttons —
+        # below the height that fits its column. Without this, an even
+        # 50/50 split could clip the lower buttons (Use/Close/Copy/Cut/Clear
+        # don't all fit in ~150px).
+        n_buttons = 3 + len(extra_buttons)  # 3 standard + caller's extras
+        strip_min = (
+            n_buttons * ICON_BTN_SIZE
+            + max(0, n_buttons - 1) * 4
+        )
+        self.setMinimumHeight(max(strip_min, self.MIN_EDITOR_HEIGHT))
+
         self.refresh()
 
     # --- actions -----------------------------------------------------------
@@ -441,6 +502,132 @@ class _EditorPane(QWidget):
         self._copy_btn.setEnabled(has)
 
 
+class _CustomPromptEdit(QPlainTextEdit):
+    """Multi-line input for the Custom preset's free-form instruction.
+
+    Two non-default behaviours layered on QPlainTextEdit:
+
+      ⌘↵ submits — emits `submit`. Plain Enter still inserts a newline (the
+      field is multi-line because real instructions can be long).
+
+      ↑/↓ recall — bash-style. ↑ pressed when the cursor is at the very start
+      of the text walks back through history (older entries); ↓ at the very
+      end walks forward (newer); going past the newest restores the user's
+      pre-recall draft. Anywhere in the middle, ↑/↓ move the cursor as usual.
+
+    History is the persistent CUSTOM_HISTORY_FILE list; navigation never
+    mutates it. Submitting calls remember(), which prepends the instruction
+    and rewrites the file.
+    """
+
+    submit = pyqtSignal()
+    escape = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._history: list[str] = _load_custom_history()
+        # -1 means "the user's current draft" (not pointing at a history entry).
+        self._history_idx: int = -1
+        # Stash of the user's text the moment they first hit ↑, so ↓ past the
+        # newest entry can restore exactly what they had typed.
+        self._draft: str = ""
+
+    def remember(self, instruction: str):
+        """Persist a just-submitted instruction at the top of history."""
+        instruction = instruction.strip()
+        if not instruction:
+            return
+        # Dedupe: if it's already at the top, nothing to do; otherwise pull
+        # any older copy out and re-insert at position 0.
+        if self._history and self._history[0] == instruction:
+            return
+        self._history = [instruction] + [
+            h for h in self._history if h != instruction
+        ]
+        _save_custom_history(self._history)
+        self._history_idx = -1
+        self._draft = ""
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        mods = event.modifiers()
+
+        # ⌘↵ (or Ctrl+↵) — submit. Plain Enter still inserts a newline.
+        is_submit_modifier = bool(mods & (
+            Qt.KeyboardModifier.MetaModifier
+            | Qt.KeyboardModifier.ControlModifier
+        ))
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and is_submit_modifier:
+            self.submit.emit()
+            return
+
+        # On macOS, the arrow keys arrive with Qt.KeyboardModifier.KeypadModifier
+        # set, so a plain `not mods` test fails for them. Only treat the
+        # "active" modifiers as blocking; the keypad flag is innocent
+        # context and must be ignored. Same trap for Esc on some layouts.
+        active_mods = (
+            Qt.KeyboardModifier.ShiftModifier
+            | Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.MetaModifier
+            | Qt.KeyboardModifier.AltModifier
+        )
+        plain = not (mods & active_mods)
+
+        # Esc — close the row (StudioWindow toggles us off and returns focus
+        # to the top pane). Done via a signal so the field knows nothing
+        # about the surrounding window layout. Plain Esc only — Ctrl+Esc is
+        # the global "cancel recording" hotkey and must not also close us.
+        if key == Qt.Key.Key_Escape and plain:
+            self.escape.emit()
+            return
+
+        cursor = self.textCursor()
+
+        # ↑ — at the first line of the doc, recall the previous (older)
+        # history entry. The bash trick: we check the line (block) the
+        # cursor is in, NOT its position-in-line. On a recalled single-line
+        # entry the cursor lands at end-of-line, but it's still on block 0,
+        # so the next ↑ keeps walking back through history. On multi-line
+        # text, ↑ first walks the cursor up through lines and only paginates
+        # history once it reaches the first line — same as bash.
+        if (key == Qt.Key.Key_Up and plain
+                and cursor.blockNumber() == 0
+                and self._history_idx + 1 < len(self._history)):
+            if self._history_idx == -1:
+                # First step into history — stash the draft for restore.
+                self._draft = self.toPlainText()
+            self._history_idx += 1
+            self._set_text(self._history[self._history_idx])
+            return
+
+        # ↓ — at the last line, recall the next (newer) entry, or restore
+        # the stashed draft when stepping past the newest. Only intercepts
+        # while we're already navigating (history_idx >= 0); otherwise the
+        # default cursor-down behaviour applies.
+        last_block = self.document().blockCount() - 1
+        if (key == Qt.Key.Key_Down and plain
+                and cursor.blockNumber() == last_block
+                and self._history_idx >= 0):
+            if self._history_idx > 0:
+                self._history_idx -= 1
+                self._set_text(self._history[self._history_idx])
+            else:
+                self._history_idx = -1
+                self._set_text(self._draft)
+            return
+
+        super().keyPressEvent(event)
+
+    def _set_text(self, text: str):
+        """Replace content and land the cursor at the end (so the next ↓ at
+        end of doc is correctly detected, and so a recalled instruction is
+        ready to be edited at its tail)."""
+        self.setPlainText(text)
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
+
+
 class StudioWindow(QWidget):
     # Opens short — a single dictation field (no result pane yet). On the first
     # transform the result pane appears and the window grows to TWO_PANE_HEIGHT
@@ -449,6 +636,12 @@ class StudioWindow(QWidget):
     DEFAULT_WIDTH = 400
     DEFAULT_HEIGHT = 260
     TWO_PANE_HEIGHT = 620
+    # Extra height we add when the Custom row is revealed. Window grows by
+    # this much on open and shrinks back on close so the row's space is given
+    # back when not in use (the default state stays as compact as before).
+    # Calibrated empirically against the input's fixed height + the layout
+    # spacing slot the now-visible row introduces between toolbar and split.
+    CUSTOM_EXTRA_PX = 64
 
     # Emitted from the transform worker thread back onto the Qt main thread
     # (cross-thread signals are delivered queued).
@@ -521,6 +714,21 @@ class StudioWindow(QWidget):
         self._polish_btn.setToolTip("Rewrite the text above (LLM) into the pane below")
         self._polish_btn.clicked.connect(self._run_polish)
 
+        # Custom is a peer of Polish — same row, but it doesn't run anything
+        # on click. It toggles a second row underneath where the user types
+        # (or dictates) a free-form instruction. Hidden by default so the
+        # window stays compact for the common case (just Polish).
+        self._custom_btn = QPushButton("Custom")
+        self._custom_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._custom_btn.setCheckable(True)  # visually pressed when row is open
+        self._custom_btn.setToolTip(
+            "Open a free-form prompt field — dictation routes there while it's focused"
+        )
+        # toggled(bool) carries the NEW checked state, unlike clicked() which
+        # would force us to re-read isChecked() and confuse the path with Esc
+        # (which closes without ever clicking the button).
+        self._custom_btn.toggled.connect(self._on_custom_toggled)
+
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
         toolbar.addWidget(self._undo_btn)
@@ -528,7 +736,58 @@ class StudioWindow(QWidget):
         toolbar.addWidget(self._clear_all_btn)
         toolbar.addSpacing(12)
         toolbar.addWidget(self._polish_btn)
+        toolbar.addWidget(self._custom_btn)
         toolbar.addStretch(1)
+
+        # --- Custom row (hidden by default) --------------------------------
+        # Shown only when the Custom button is toggled on. While visible AND
+        # focused, dictation routes here instead of into the top pane (see
+        # append_dictation). ⌘↵ submits, ↑/↓ at the text boundaries cycle
+        # through history, Esc closes the row.
+        self._custom_input = _CustomPromptEdit()
+        self._custom_input.setPlaceholderText(
+            "Prompt — ⌘↵ to run, ↑/↓ history"
+        )
+        # Compact, fixed height — about two comfortable lines of text. Long
+        # instructions scroll internally rather than ballooning the row.
+        self._custom_input.setFixedHeight(60)
+        self._custom_input.setFrameShape(QPlainTextEdit.Shape.NoFrame)
+        self._custom_input.setStyleSheet(_PROMPT_QSS)
+        self._custom_input.submit.connect(self._run_custom)
+        self._custom_input.escape.connect(self._close_custom)
+        # Apply enables only when both source text and instruction are non-
+        # empty — refresh on every keystroke so the button state tracks the
+        # field live.
+        self._custom_input.textChanged.connect(self._refresh)
+
+        self._apply_btn = icon_button(
+            "play.fill", "▶", "Apply the Custom instruction (⌘↵)"
+        )
+        self._apply_btn.clicked.connect(self._run_custom)
+
+        self._custom_row = QWidget()
+        custom_row_layout = QHBoxLayout(self._custom_row)
+        custom_row_layout.setContentsMargins(0, 0, 0, 0)
+        # Match the panes' editor↔strip spacing exactly so the Custom row's
+        # input + apply column lines up with the panes' editor + strip column
+        # below — same FRAME_MARGIN gap, same 32 px button column on the
+        # right edge, same right margin to the window border.
+        custom_row_layout.setSpacing(FRAME_MARGIN)
+        custom_row_layout.addWidget(self._custom_input, 1)
+        # Top-aligned so the icon sits at the top of the row, matching the
+        # panes' strip columns which also stack from the top (addStretch
+        # at the bottom).
+        custom_row_layout.addWidget(
+            self._apply_btn, 0, Qt.AlignmentFlag.AlignTop
+        )
+        self._custom_row.hide()
+        # Tracks whether we grew the window when Custom opened, so close can
+        # shrink it back by EXACTLY the same delta — not by snapping to a
+        # remembered absolute height. Restoring an absolute height was wrong:
+        # any manual resize the user did while Custom was open would be
+        # silently undone on close (they'd grow the window to read a long
+        # transform, close Custom, and lose all that height).
+        self._custom_grew_window = False
 
         layout = QVBoxLayout(self)
         # Even frame: window margin == editor↔strip gap == strip↔edge gap, so
@@ -537,7 +796,13 @@ class StudioWindow(QWidget):
         layout.setContentsMargins(FRAME_MARGIN, FRAME_MARGIN, FRAME_MARGIN, FRAME_MARGIN)
         layout.setSpacing(8)
         layout.addLayout(toolbar)
-        layout.addWidget(split)
+        layout.addWidget(self._custom_row)
+        # stretch=1 — the splitter must absorb ALL extra vertical space so
+        # the panes grow with the window. Without this stretch, QVBoxLayout
+        # only gives the splitter its sizeHint (≈ sum of pane minimums) and
+        # the rest stays as empty space below — exactly what made the panes
+        # collapse on Custom toggle.
+        layout.addWidget(split, 1)
 
         self._transform_done.connect(self._on_transform_done)
         self._transform_failed.connect(self._on_transform_failed)
@@ -564,12 +829,117 @@ class StudioWindow(QWidget):
     # --- dictation routing -------------------------------------------------
 
     def append_dictation(self, text: str):
-        """Append a freshly transcribed chunk into the top pane. New dictation
-        always lands in the source ("было"), never in the result."""
-        self.top.append_line(text)
-        log.info("Studio: appended dictation (%d chars)", len(text.strip()))
+        """Append a freshly transcribed chunk into whichever field is active.
+        New dictation lands in the Custom prompt field if the user has it
+        open AND focused (so they can dictate the instruction itself);
+        otherwise it goes to the top pane (the default flow)."""
+        if (self._custom_row.isVisible()
+                and self._custom_input.hasFocus()):
+            self._append_to_custom(text)
+            log.info("Studio: appended dictation to Custom (%d chars)",
+                     len(text.strip()))
+        else:
+            self.top.append_line(text)
+            log.info("Studio: appended dictation (%d chars)", len(text.strip()))
+
+    def _append_to_custom(self, text: str):
+        """Insert a dictation chunk at the end of the Custom prompt field,
+        joined to existing content with a single space (so multi-chunk
+        dictations read as one continuous instruction)."""
+        text = text.strip()
+        if not text:
+            return
+        cursor = self._custom_input.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self._custom_input.toPlainText():
+            cursor.insertText(" " + text)
+        else:
+            cursor.insertText(text)
+        self._custom_input.setTextCursor(cursor)
+        self._custom_input.ensureCursorVisible()
+
+    # --- Custom row toggle -------------------------------------------------
+
+    def _on_custom_toggled(self, checked: bool):
+        """Slot for the Custom button's `toggled(bool)` signal. Bridges a
+        click to the right open/close path, and reverts the auto-toggle if
+        we can't honour it right now (mid-transform)."""
+        if self._transforming:
+            # Revert the auto-toggle Qt did on the click; without this the
+            # button would visually be in the new state while the row stayed
+            # in the old.
+            self._custom_btn.blockSignals(True)
+            self._custom_btn.setChecked(not checked)
+            self._custom_btn.blockSignals(False)
+            return
+        if checked:
+            self._open_custom()
+        else:
+            self._close_custom()
+
+    def _open_custom(self):
+        """Reveal the Custom prompt row and focus it (so dictation routes
+        there). Grow the window by exactly CUSTOM_EXTRA_PX so the row's
+        space is added rather than stolen from the panes; the matching
+        close-side shrink subtracts the same delta, so any manual resize
+        the user does while Custom is open is preserved on close.
+
+        Splitter sizes are snapshotted and restored on the next event-loop
+        tick (via QTimer.singleShot(0, ...)) — that's the key to keeping
+        pane heights stable across the open/close cycle. Without that
+        deferred restore, QSplitter eagerly redistributes between the
+        intermediate steps (show → resize → settle) and the panes drift to
+        a default 50/50 split. A direct setSizes() inline doesn't work
+        because the splitter hasn't finished its own resize handling yet."""
+        pane_sizes = self._split.sizes()
+        self._custom_row.show()
+        if not self._custom_grew_window:
+            self.resize(self.width(), self.height() + self.CUSTOM_EXTRA_PX)
+            self._custom_grew_window = True
+        QTimer.singleShot(0, lambda: self._split.setSizes(pane_sizes))
+        self._custom_input.setFocus()
+        self._refresh()
+
+    def _close_custom(self):
+        """Hide the Custom prompt row, shrink the window back by the SAME
+        delta we added on open, and return focus to the top pane.
+        Idempotent: callable from Esc inside the Custom field, the toggle
+        button, or anywhere else.
+
+        Same deferred snapshot/restore as _open_custom. The hide() releases
+        the row's space to the splitter, then resize() takes the same delta
+        back from the window — net zero on the panes, but only if the
+        intermediate redistribution doesn't leak. Restoring on the next
+        tick (after both events have been processed) keeps it from
+        leaking."""
+        pane_sizes = self._split.sizes()
+        self._custom_row.hide()
+        # Sync the button visual state without re-emitting toggled() (which
+        # would call us again).
+        self._custom_btn.blockSignals(True)
+        self._custom_btn.setChecked(False)
+        self._custom_btn.blockSignals(False)
+        if self._custom_grew_window:
+            self.resize(self.width(), self.height() - self.CUSTOM_EXTRA_PX)
+            self._custom_grew_window = False
+        QTimer.singleShot(0, lambda: self._split.setSizes(pane_sizes))
+        self.top.editor.setFocus()
+        self._refresh()
 
     # --- transform (Phase 1 temporary slice) -------------------------------
+
+    def _start_transform(self, placeholder: str):
+        """Common pre-transform setup shared by Polish and Custom: reveal the
+        result pane, lock it, show a placeholder, refresh button states. The
+        worker thread + signal plumbing is per-transform."""
+        self._transforming = True
+        if self.bottom.isHidden():
+            self.bottom.show()              # reveal the result pane
+            self._grow_for_two_panes()      # grow the short window to fit two
+            self._balance_split()
+        self.bottom.editor.setReadOnly(True)
+        self.bottom.controller.show_placeholder(placeholder)
+        self._refresh()
 
     def _run_polish(self):
         """Run the hardcoded Polish preset over the whole top pane → bottom.
@@ -578,22 +948,44 @@ class StudioWindow(QWidget):
         text = self.top.editor.toPlainText().strip()
         if not text or self._transforming:
             return
-        self._transforming = True
-        if self.bottom.isHidden():
-            self.bottom.show()              # reveal the result pane
-            self._grow_for_two_panes()      # grow the short window to fit two
-            self._balance_split()
-        self.bottom.editor.setReadOnly(True)
-        self.bottom.controller.show_placeholder("Polishing…")
-        self._refresh()
-        threading.Thread(target=self._transform_worker, args=(text,), daemon=True).start()
+        self._start_transform("Polishing…")
+        threading.Thread(
+            target=self._polish_worker, args=(text,), daemon=True
+        ).start()
 
-    def _transform_worker(self, text: str):
+    def _polish_worker(self, text: str):
         try:
             out = studio_llm.transform(text, studio_llm.POLISH)
             self._transform_done.emit(out)
         except Exception as e:
-            log.exception("Studio transform failed")
+            log.exception("Studio Polish failed")
+            self._transform_failed.emit(str(e))
+
+    def _run_custom(self):
+        """Apply the Custom instruction (free-form prompt) to the top pane.
+        Both the source text and the instruction must be non-empty; otherwise
+        nothing happens (the Apply button is disabled in that state anyway,
+        but ⌘↵ from the keyboard reaches us regardless)."""
+        text = self.top.editor.toPlainText().strip()
+        instruction = self._custom_input.toPlainText().strip()
+        if not text or not instruction or self._transforming:
+            return
+        # Persist the instruction at the top of history before we kick off
+        # the worker; if the run later fails, the instruction is still
+        # recallable for a retry.
+        self._custom_input.remember(instruction)
+        self._custom_input.clear()
+        self._start_transform("Applying…")
+        threading.Thread(
+            target=self._custom_worker, args=(text, instruction), daemon=True
+        ).start()
+
+    def _custom_worker(self, text: str, instruction: str):
+        try:
+            out = studio_llm.transform_custom(text, instruction)
+            self._transform_done.emit(out)
+        except Exception as e:
+            log.exception("Studio Custom failed")
             self._transform_failed.emit(str(e))
 
     def _on_transform_done(self, result: str):
@@ -706,6 +1098,12 @@ class StudioWindow(QWidget):
         # Polish runs the top pane; disabled while empty or mid-transform.
         self._polish_btn.setEnabled(
             bool(self.top.editor.toPlainText()) and not self._transforming)
+        # Apply (Custom) needs BOTH a source text and a typed instruction.
+        # While transforming, lock it like Polish.
+        self._apply_btn.setEnabled(
+            bool(self.top.editor.toPlainText())
+            and bool(self._custom_input.toPlainText().strip())
+            and not self._transforming)
         self._use_btn.setEnabled(
             bool(self.bottom.editor.toPlainText()) and not self._transforming)
         self._close_btn.setEnabled(not self._transforming)

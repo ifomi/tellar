@@ -58,6 +58,19 @@ _OUTPUT_ONLY = (
     "no quotes, no markdown fences. Keep the original language."
 )
 
+# Meta-template for the Custom preset (free-form runtime instruction). Differs
+# structurally from fixed presets: in Polish/Email/Slack the system message IS
+# the instruction; here it just frames the model as an assistant that follows
+# whatever the user typed in the Custom field. The actual instruction travels
+# in the user message together with the source text. Output discipline is the
+# same; we drop the "keep the original language" rule because Custom is the
+# escape hatch where the user might explicitly ask for a translation.
+CUSTOM_SYSTEM = (
+    "You are a writing assistant. Apply the user's instruction to their "
+    "text. Output ONLY the resulting text — no preamble, no explanations, "
+    "no quotes, no markdown fences."
+)
+
 POLISH = Preset(
     key="polish",
     label="Polish",
@@ -198,6 +211,36 @@ def transform(text: str, preset: Preset) -> str:
     log.info(
         "Studio transform '%s': %d chars -> %d chars in %.2fs",
         preset.key, len(text), len(out), time.time() - t0,
+    )
+    return _strip_preamble(out)
+
+
+def transform_custom(text: str, instruction: str) -> str:
+    """Apply a user-supplied runtime instruction to the text.
+
+    Differs from transform(text, preset) in WHERE the instruction lives:
+    fixed presets freeze it into the system message at import time; here it
+    arrives at call time and rides in the user message alongside the text.
+    Same model, same chat-template builder, same output cleanup.
+
+    Blocking — call from a worker thread, not the Qt main thread.
+    """
+    get_model()
+    from mlx_lm import generate
+    from mlx_lm.sample_utils import make_sampler
+
+    user_msg = f"INSTRUCTION: {instruction}\n\nTEXT:\n{text}"
+    prompt = build_chat_prompt(_tokenizer, CUSTOM_SYSTEM, user_msg)
+    sampler = make_sampler(temp=0.2)
+    t0 = time.time()
+    out = generate(
+        _model, _tokenizer, prompt,
+        max_tokens=1024, sampler=sampler, verbose=False,
+    )
+    log.info(
+        "Studio transform_custom: %d chars text + %d chars instruction "
+        "-> %d chars in %.2fs",
+        len(text), len(instruction), len(out), time.time() - t0,
     )
     return _strip_preamble(out)
 
