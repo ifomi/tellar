@@ -867,15 +867,27 @@ class TellarApp:
 
     def on_hotkey_start(self):
         if not self._ready or self._recording:
+            # Diagnostic: a "silent reject" is the prime suspect for the
+            # "I pressed ⌃Space but it didn't record" UX bug. Logging both
+            # flags + timestamp so a user-reported repro can be matched
+            # against the exact pipeline phase that was still busy.
+            log.info(
+                "Hotkey: start IGNORED (ready=%s, recording=%s, t=%.3f)",
+                self._ready, self._recording, time.monotonic(),
+            )
             return
-        log.info("Hotkey: start recording")
+        log.info("Hotkey: start recording (t=%.3f)", time.monotonic())
         self._recording = True
         self.bridge.recording_started.emit()
 
     def on_hotkey_stop(self):
         if not self._recording:
+            log.info(
+                "Hotkey: stop IGNORED (recording=%s, t=%.3f)",
+                self._recording, time.monotonic(),
+            )
             return
-        log.info("Hotkey: stop recording")
+        log.info("Hotkey: stop recording (t=%.3f)", time.monotonic())
         self._recording = False
         self.bridge.recording_stopped.emit()
 
@@ -1038,6 +1050,7 @@ class TellarApp:
         log.info("Saved sample WAV: %s", dest)
 
     def _insert_result(self, text):
+        log.info("Insert: enter, _recording -> False (t=%.3f)", time.monotonic())
         self._recording = False
         # Studio mode overrides Auto Paste: the text goes into the Studio
         # window for editing instead of being pasted/copied anywhere. The
@@ -1048,8 +1061,9 @@ class TellarApp:
         auto_paste = self.menubar.is_auto_paste_enabled()
         try:
             pasted = insert_text(text, self._target_app, auto_paste)
-            log.info("Insert: %s (%d chars, auto_paste=%s)",
-                     "pasted" if pasted else "clipboard-only", len(text), auto_paste)
+            log.info("Insert: %s (%d chars, auto_paste=%s, t=%.3f)",
+                     "pasted" if pasted else "clipboard-only", len(text),
+                     auto_paste, time.monotonic())
             if pasted:
                 self.overlay.show_inserted()
             else:
@@ -1060,6 +1074,7 @@ class TellarApp:
         self._target_app = None
         self.menubar.set_icon_pixmap(_make_wave_pixmap("#00cc66"))
         QTimer.singleShot(1500, self._finish)
+        log.info("Insert: scheduled _finish in 1500ms (t=%.3f)", time.monotonic())
 
     def _route_to_studio(self, text):
         """Send a finished transcription to the Studio window instead of the
@@ -1068,7 +1083,8 @@ class TellarApp:
         try:
             self.studio.show_panel()
             self.studio.append_dictation(text)
-            log.info("Routed %d chars to Studio", len(text))
+            log.info("Routed %d chars to Studio (t=%.3f)",
+                     len(text), time.monotonic())
             self.overlay.show_studio_sent()
         except Exception:
             log.exception("Studio routing error")
@@ -1076,6 +1092,8 @@ class TellarApp:
         self._target_app = None
         self.menubar.set_icon_pixmap(_make_wave_pixmap("#00cc66"))
         QTimer.singleShot(1500, self._finish)
+        log.info("Studio route: scheduled _finish in 1500ms (t=%.3f)",
+                 time.monotonic())
 
     def on_studio_changed(self, enabled: bool):
         """Menu callback when the Studio toggle flips. Visibility is coupled to
@@ -1102,10 +1120,27 @@ class TellarApp:
         self.menubar.set_studio_enabled(False)
 
     def _finish(self):
+        # Guard: this method is QTimer'd 1.5 sec after a transcription's
+        # insert/route to flash the overlay green and reset the icon.
+        # If the user has already started a new recording in that window,
+        # blindly running cleanup here would yank the overlay, flip the
+        # icon back to white, and silently zero out _recording — killing
+        # the new take mid-record. Skip when a recording is in progress;
+        # the next _finish (scheduled by the next insert) will do the
+        # cleanup at the right time.
+        if self._recording:
+            log.info(
+                "_finish: skipped — new recording already in progress "
+                "(t=%.3f)", time.monotonic()
+            )
+            return
+        log.info("_finish: enter (t=%.3f)", time.monotonic())
         self.overlay.hide_overlay()
         self.menubar.set_icon_pixmap(_make_wave_pixmap("#ffffff"))
         self._recording = False
         self.menubar.set_record_action_text("Start Recording  (⌃Space)")
+        log.info("_finish: done, ready for new hotkey (t=%.3f)",
+                 time.monotonic())
 
 
 LOCK_FILE = STATE_DIR / "tellar.lock"

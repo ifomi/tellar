@@ -311,7 +311,21 @@ class _UndoController:
     # --- programmatic mutations (each one undo step) -----------------------
 
     def append_line(self, text: str):
-        """Append text on its own line as one step (dictation into the top)."""
+        """Insert dictation at the current caret position as one undo step.
+
+        Three cases, picked from where the user has put the caret:
+
+        - **Caret at end of document.** Familiar multi-chunk flow: add a
+          newline separator, then the text. This is the default for
+          successive dictations and reads as paragraphs.
+        - **Caret mid-document, no selection.** Inline insert at the
+          chosen position; pad with a single space on either side when
+          the neighbouring character isn't whitespace, so dictation
+          drops naturally into a sentence already being typed.
+        - **Caret has a selection.** Replace the selection verbatim — no
+          padding, no newline. The user explicitly chose a region to
+          overwrite; the smart-spacing logic would just get in the way.
+        """
         text = text.strip()
         if not text:
             return
@@ -321,10 +335,25 @@ class _UndoController:
         self._redo.clear()
         self._applying = True
         cursor = self.editor.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        if not self.editor.document().isEmpty():
-            cursor.insertText("\n")
-        cursor.insertText(text)
+
+        if cursor.hasSelection():
+            cursor.insertText(text)
+        elif cursor.atEnd():
+            if not self.editor.document().isEmpty():
+                cursor.insertText("\n")
+            cursor.insertText(text)
+        else:
+            doc = self.editor.document()
+            pos = cursor.position()
+            prev_char = doc.characterAt(pos - 1) if pos > 0 else ""
+            next_char = (
+                doc.characterAt(pos)
+                if pos < doc.characterCount() - 1 else ""
+            )
+            prefix = "" if prev_char in (" ", "\n", "\t", "") else " "
+            suffix = "" if next_char in (" ", "\n", "\t", "") else " "
+            cursor.insertText(prefix + text + suffix)
+
         self.editor.setTextCursor(cursor)
         self.editor.ensureCursorVisible()
         self._applying = False
@@ -807,10 +836,13 @@ class StudioWindow(QWidget):
         self._undo_btn.clicked.connect(self._undo)
         self._redo_btn = icon_button("arrow.clockwise", "↻", "Redo (⌘⇧Z)")
         self._redo_btn.clicked.connect(self._redo)
-        # Trash everything: a common action affecting BOTH panes, so it lives in
-        # the top toolbar (not tied to one pane). Filled trash distinguishes it
-        # from the outline per-pane Clear.
-        self._clear_all_btn = icon_button("trash.fill", "Clr", "Clear both panes")
+        # Trash everything: a common action affecting BOTH panes AND the
+        # prompt field, so it lives in the top toolbar (not tied to any
+        # one widget). Filled trash distinguishes it from the outline
+        # per-widget Clear glyphs.
+        self._clear_all_btn = icon_button(
+            "trash.fill", "Clr", "Clear both panes and the prompt"
+        )
         self._clear_all_btn.clicked.connect(self._clear_all)
         # Diff highlighting toggle. Sits with the other pane-wide controls
         # because it acts on both panes at once. The eye glyph reads as
@@ -1217,13 +1249,16 @@ class StudioWindow(QWidget):
         self._refresh()
 
     def _clear_all(self):
-        """Trash everything: clear both panes at once. Each pane clears as its
-        own undo step (focus-based Undo restores the focused pane). Like the
-        per-pane Clear, this does NOT collapse the split — only Close (×) does."""
+        """Trash everything: clear both panes AND the prompt field at once.
+        Each pane clears as its own undo step (focus-based Undo restores
+        the focused pane). The prompt field is a transient input — no undo
+        history kept for it — so a wipe is final there. Like the per-pane
+        Clear, this does NOT collapse the split — only Close (×) does."""
         if self._transforming:
             return
         self.top.controller.clear()
         self.bottom.controller.clear()
+        self._custom_input.clear()
         self._refresh()
 
     def _grow_for_two_panes(self):
@@ -1244,12 +1279,27 @@ class StudioWindow(QWidget):
     def show_panel(self):
         """Show the panel and bring it forward. Called when a Studio-mode
         recording starts so the window itself signals where the dictation
-        will land."""
-        if not self.isVisible():
+        will land. On the FIRST show, focus lands in the top pane (the
+        dictation target — the prompt field is for runtime instructions,
+        not the default place to type when Studio first opens). On
+        subsequent re-raises (every recording start re-calls show_panel)
+        we leave focus alone — the user may have placed the caret in the
+        prompt field on purpose to dictate an instruction there, and a
+        forced setFocus would yank it back to the top mid-record."""
+        first_show = not self.isVisible()
+        if first_show:
             self._place_default()
         self.show()
         self.raise_()
         self.activateWindow()
+        if first_show:
+            # Defer the setFocus() to the next event-loop tick: at this
+            # point the window has just been shown but the activation
+            # chain hasn't settled, and an immediate setFocus on a
+            # not-yet-active window is silently ignored. By the next
+            # tick activateWindow has taken effect and the focus
+            # actually lands.
+            QTimer.singleShot(0, self.top.editor.setFocus)
 
     def closeEvent(self, event):
         """Closing the window leaves Studio routing: visibility is coupled to
@@ -1316,10 +1366,12 @@ class StudioWindow(QWidget):
         self._use_btn.setEnabled(
             bool(self.bottom.editor.toPlainText()) and not self._transforming)
         self._close_btn.setEnabled(not self._transforming)
-        # Clear-all: enabled if either pane has anything to wipe.
+        # Clear-all: enabled if any of the three widgets has anything to
+        # wipe (the two panes plus the prompt field).
         self._clear_all_btn.setEnabled(
             (bool(self.top.editor.toPlainText())
-             or bool(self.bottom.editor.toPlainText()))
+             or bool(self.bottom.editor.toPlainText())
+             or bool(self._custom_input.toPlainText()))
             and not self._transforming)
         self.top.refresh()
         self.bottom.refresh()
