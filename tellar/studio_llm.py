@@ -48,6 +48,12 @@ class Preset:
     system: str        # instruction placed in the system message
     temperature: float = 0.2
     max_tokens: int = 1024
+    # Whether the Studio should highlight word-level differences between the
+    # source pane and this preset's result. True for in-place edits like Polish
+    # (where every change is a meaningful copy-edit). Set False for presets
+    # that produce a wholly different output — translate, summarise — where
+    # almost every token is "different" and the highlighting is just noise.
+    show_diff: bool = True
 
 
 # Output-only discipline (a gotcha with small models): they love prepending

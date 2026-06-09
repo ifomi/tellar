@@ -57,7 +57,7 @@ from PyQt6.QtWidgets import (
 import threading
 from pathlib import Path
 
-from . import studio_llm
+from . import diff_highlight, studio_llm
 from .logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -88,6 +88,15 @@ QPushButton {
 QPushButton:hover:enabled { background: #f2f2f2; }
 QPushButton:pressed:enabled { background: #e6e6e6; }
 QPushButton:disabled { background: #f7f7f7; border-color: #ececec; }
+"""
+
+# Same square button, plus a clearly different background when checked so the
+# diff toggle reads as ON at a glance. The accent blue echoes macOS native
+# selection colour without leaning on a system palette query (which differs
+# light/dark and would ship with no dark theme in v1 anyway).
+_TOGGLE_BTN_QSS = _ICON_BTN_QSS + """
+QPushButton:checked { background: #d8e9ff; border-color: #7aa7e0; }
+QPushButton:checked:hover:enabled { background: #c8dffc; }
 """
 
 # QTextEdit defaults to a sunken bevelled frame, which renders thicker on the
@@ -149,6 +158,35 @@ def _save_custom_history(entries: list[str]):
         log.exception("Failed to save Custom history")
 
 
+# Persisted toggle state for the Diff Highlighting button. One byte ("1"/"0")
+# in the same Application Support directory as vocabulary.txt and the Custom
+# history — outside the bundle so it survives rebuilds. First-launch default
+# is ON: this is a comprehension feature; users discover it before they decide
+# to silence it.
+DIFF_SETTINGS_FILE = (
+    Path.home() / "Library" / "Application Support" / "Tellar"
+    / "studio_diff_enabled.txt"
+)
+
+
+def _load_diff_enabled() -> bool:
+    try:
+        return DIFF_SETTINGS_FILE.read_text().strip() == "1"
+    except FileNotFoundError:
+        return True
+    except Exception:
+        log.exception("Failed to read diff toggle state")
+        return True
+
+
+def _save_diff_enabled(enabled: bool):
+    try:
+        DIFF_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DIFF_SETTINGS_FILE.write_text("1" if enabled else "0")
+    except Exception:
+        log.exception("Failed to save diff toggle state")
+
+
 def sf_icon(name: str) -> QIcon | None:
     """Render an SF Symbol as a black monochrome QIcon, or None if unavailable.
 
@@ -196,11 +234,14 @@ def sf_icon(name: str) -> QIcon | None:
         return None
 
 
-def icon_button(symbol: str, fallback_text: str, tip: str) -> QPushButton:
+def icon_button(symbol: str, fallback_text: str, tip: str,
+                checkable: bool = False) -> QPushButton:
     """A fixed-width toolbar button showing an SF Symbol icon (or fallback text).
 
     All Studio buttons are NoFocus: clicking one must NOT steal focus from the
-    text pane, so the focused pane (which Undo/Redo act on) stays put.
+    text pane, so the focused pane (which Undo/Redo act on) stays put. Pass
+    `checkable=True` for a toggle button (e.g. the diff highlight switch); a
+    different stylesheet draws an accent-blue background in the checked state.
     """
     btn = QPushButton()
     icon = sf_icon(symbol)
@@ -212,7 +253,11 @@ def icon_button(symbol: str, fallback_text: str, tip: str) -> QPushButton:
     btn.setToolTip(tip)
     btn.setFixedSize(ICON_BTN_SIZE, ICON_BTN_SIZE)
     btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-    btn.setStyleSheet(_ICON_BTN_QSS)
+    if checkable:
+        btn.setCheckable(True)
+        btn.setStyleSheet(_TOGGLE_BTN_QSS)
+    else:
+        btn.setStyleSheet(_ICON_BTN_QSS)
     return btn
 
 
@@ -234,18 +279,28 @@ class _UndoController:
     use-as-input) is one undo step; a burst of manual typing coalesces into one
     step after TYPING_COMMIT_MS. `on_change` fires whenever undo/redo
     availability may have changed so the owner can refresh button states.
+    `on_any_change` fires once per content change (manual OR programmatic) and
+    is used by the Studio to recompute live diff highlights — purely
+    formatting changes (the diff paint itself) are filtered out via
+    `_painting` so the recompute can't loop.
     """
 
-    def __init__(self, editor: QTextEdit, on_change=None):
+    def __init__(self, editor: QTextEdit, on_change=None, on_any_change=None):
         self.editor = editor
         self._on_change = on_change
+        self._on_any_change = on_any_change
         # We run our own stack; turn off Qt's so it doesn't fight us and so ⌘Z
         # reaches our window shortcut instead of the editor's own handler.
         editor.setUndoRedoEnabled(False)
         self._undo: list[str] = []   # snapshots to step back to
         self._redo: list[str] = []   # snapshots to step forward to
         self._baseline = ""          # last committed text
-        self._applying = False       # True while WE mutate the editor
+        self._applying = False       # True while WE mutate the editor's content
+        # True while WE merge a char-format (diff highlight paint). Qt6 fires
+        # textChanged for format-only edits too, so without this guard a paint
+        # would notify on_any_change and trigger another recompute → repaint
+        # → recompute …  Filter format-only changes out entirely.
+        self._painting = False
         self._transient = False      # True while a non-committed placeholder shows
         self._timer = QTimer(editor)
         self._timer.setSingleShot(True)
@@ -318,7 +373,17 @@ class _UndoController:
     # --- manual typing -----------------------------------------------------
 
     def _on_text_changed(self):
+        # Format-only edits (a diff highlight repaint) must not trigger anything
+        # — they don't change the text, and notifying on_any_change here would
+        # loop right back into another recompute/repaint.
+        if self._painting:
+            return
         if self._applying:
+            # Programmatic content change (set_result, append_line, replace_all).
+            # Don't touch the user-edit bookkeeping, but DO notify the live diff
+            # so it sees the new content and can recompute against it.
+            if self._on_any_change:
+                self._on_any_change()
             return
         # A manual edit invalidates the redo branch and (re)starts the coalesce
         # timer; the burst commits as one step after a short pause.
@@ -326,6 +391,8 @@ class _UndoController:
         self._redo.clear()
         self._timer.start()
         self._changed()
+        if self._on_any_change:
+            self._on_any_change()
 
     def commit_pending(self):
         """Commit any uncommitted manual edits as a single undo step."""
@@ -358,6 +425,17 @@ class _UndoController:
         self._changed()
 
     # --- helpers -----------------------------------------------------------
+
+    def apply_format(self, fn):
+        """Run a format-only mutation (e.g. paint diff highlights) without
+        triggering any of the change-tracking machinery. Suspends both the
+        manual-edit and programmatic-change paths so the repaint stays a
+        purely visual operation."""
+        self._painting = True
+        try:
+            fn(self.editor)
+        finally:
+            self._painting = False
 
     def _push_undo(self, snapshot: str):
         self._undo.append(snapshot)
@@ -404,7 +482,8 @@ class _EditorPane(QWidget):
     # small its content vanishes with no room for a scrollbar.
     MIN_EDITOR_HEIGHT = 90
 
-    def __init__(self, placeholder: str, on_focus, on_change, extra_buttons=()):
+    def __init__(self, placeholder: str, on_focus, on_change,
+                 on_any_change=None, extra_buttons=()):
         super().__init__()
 
         self.editor = _FocusTextEdit()
@@ -420,7 +499,9 @@ class _EditorPane(QWidget):
         self.editor.setFrameShape(QTextEdit.Shape.NoFrame)  # QSS draws the border
         self.editor.setStyleSheet(_EDITOR_QSS)
         self.editor.focused.connect(lambda: on_focus(self))
-        self.controller = _UndoController(self.editor, on_change=on_change)
+        self.controller = _UndoController(
+            self.editor, on_change=on_change, on_any_change=on_any_change,
+        )
 
         self._copy_btn = icon_button("doc.on.doc", "Copy",
                                      "Copy this pane to the clipboard")
@@ -629,19 +710,15 @@ class _CustomPromptEdit(QPlainTextEdit):
 
 
 class StudioWindow(QWidget):
-    # Opens short — a single dictation field (no result pane yet). On the first
-    # transform the result pane appears and the window grows to TWO_PANE_HEIGHT
-    # (grow-only — never shrinks a window the user already enlarged); after that
-    # the user resizes freely.
+    # Opens with the toolbar, the top pane, and the always-on prompt row at
+    # the bottom; the result pane appears on the first transform and grows
+    # the window to TWO_PANE_HEIGHT (grow-only — never shrinks one the user
+    # already enlarged). Heights are sized so the top pane has a comfortable
+    # ~150 px before any user resize, plus the prompt row's fixed 60 px and
+    # the toolbar.
     DEFAULT_WIDTH = 400
-    DEFAULT_HEIGHT = 260
-    TWO_PANE_HEIGHT = 620
-    # Extra height we add when the Custom row is revealed. Window grows by
-    # this much on open and shrinks back on close so the row's space is given
-    # back when not in use (the default state stays as compact as before).
-    # Calibrated empirically against the input's fixed height + the layout
-    # spacing slot the now-visible row introduces between toolbar and split.
-    CUSTOM_EXTRA_PX = 64
+    DEFAULT_HEIGHT = 330
+    TWO_PANE_HEIGHT = 690
 
     # Emitted from the transform worker thread back onto the Qt main thread
     # (cross-thread signals are delivered queued).
@@ -657,7 +734,7 @@ class StudioWindow(QWidget):
         # A normal top-level window so it participates in Mission Control and
         # can be raised by clicking its thumbnail there.
         self.setWindowFlags(Qt.WindowType.Window)
-        self.setMinimumSize(320, 200)
+        self.setMinimumSize(320, 260)
         self.resize(self.DEFAULT_WIDTH, self.DEFAULT_HEIGHT)
 
         self._transforming = False
@@ -665,12 +742,34 @@ class StudioWindow(QWidget):
         # restored on Close so collapsing frees the second pane's space.
         self._pre_grow_height = None
 
+        # --- live diff highlighting ---------------------------------------
+        # Persisted toggle state (default ON). When on, the bottom pane's
+        # additions get a green tint and the top pane's deletions get a red
+        # tint, recomputed against the current text whenever either pane
+        # changes — manual edits, dictation appends, transform results, all
+        # take the same path.
+        self._diff_enabled = _load_diff_enabled()
+        # `show_diff` from the last preset that ran. Translate-style presets
+        # produce wholly different text where every token reads as "changed",
+        # so they opt out of highlighting via Preset.show_diff = False; we
+        # remember the choice across the transform's async boundary.
+        self._last_show_diff = True
+        # Debounce timer: every textChanged restarts it; on timeout we
+        # recompute. Without this, a long manual paragraph would re-tokenise
+        # and re-paint on every keystroke. 150ms is short enough to feel
+        # immediate yet long enough to coalesce a fast typist's bursts.
+        self._diff_timer = QTimer(self)
+        self._diff_timer.setSingleShot(True)
+        self._diff_timer.setInterval(150)
+        self._diff_timer.timeout.connect(self._recompute_diff_now)
+
         # --- panes ---------------------------------------------------------
         self.top = _EditorPane(
             "Dictations land here while Studio is on.\n"
             "Edit freely, run a preset, then Copy.",
             on_focus=self._set_active,
             on_change=self._refresh,
+            on_any_change=self._request_diff_recompute,
         )
         # Bottom-pane-only controls: feed the result back up to chain another
         # preset, and explicitly fold the split back to a single field.
@@ -684,6 +783,7 @@ class StudioWindow(QWidget):
             "Transform result lands here.",
             on_focus=self._set_active,
             on_change=self._refresh,
+            on_any_change=self._request_diff_recompute,
             extra_buttons=(self._use_btn, self._close_btn),
         )
         self.bottom.hide()  # the split appears on the first transform
@@ -705,89 +805,96 @@ class StudioWindow(QWidget):
         # from the outline per-pane Clear.
         self._clear_all_btn = icon_button("trash.fill", "Clr", "Clear both panes")
         self._clear_all_btn.clicked.connect(self._clear_all)
-
-        # Phase 1 temporary control: a single hardcoded "Polish" preset that
-        # proves the end-to-end slice. Phase 3 replaces this with the full
-        # preset button row driven by studio_llm.PRESETS.
-        self._polish_btn = QPushButton("Polish")
-        self._polish_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._polish_btn.setToolTip("Rewrite the text above (LLM) into the pane below")
-        self._polish_btn.clicked.connect(self._run_polish)
-
-        # Custom is a peer of Polish — same row, but it doesn't run anything
-        # on click. It toggles a second row underneath where the user types
-        # (or dictates) a free-form instruction. Hidden by default so the
-        # window stays compact for the common case (just Polish).
-        self._custom_btn = QPushButton("Custom")
-        self._custom_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._custom_btn.setCheckable(True)  # visually pressed when row is open
-        self._custom_btn.setToolTip(
-            "Open a free-form prompt field — dictation routes there while it's focused"
+        # Diff highlighting toggle. Sits with the other pane-wide controls
+        # because it acts on both panes at once. The eye glyph reads as
+        # "show me what changed"; the QSS gives the checked state an accent
+        # background so the on/off state is obvious.
+        self._diff_btn = icon_button(
+            "eye", "Diff",
+            "Highlight differences between the panes (⌘D)",
+            checkable=True,
         )
-        # toggled(bool) carries the NEW checked state, unlike clicked() which
-        # would force us to re-read isChecked() and confuse the path with Esc
-        # (which closes without ever clicking the button).
-        self._custom_btn.toggled.connect(self._on_custom_toggled)
+        self._diff_btn.setChecked(self._diff_enabled)
+        self._diff_btn.toggled.connect(self._on_diff_toggled)
+
+        # The single fixed preset for now (Phase 1). Custom prompt lives in
+        # its own always-on row at the bottom of the window — there's no
+        # toggle; the field and the pill coexist as two equally-available
+        # entry points. The sparkles glyph mirrors what Apple Intelligence
+        # uses for its Writing Tools (Polish / Rewrite / Make Friendly), so
+        # it reads as "AI tidies up the text" at a glance.
+        self._polish_btn = icon_button(
+            "sparkles", "✨",
+            "Polish — rewrite the text above (LLM) into the pane below",
+        )
+        self._polish_btn.clicked.connect(self._run_polish)
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
         toolbar.addWidget(self._undo_btn)
         toolbar.addWidget(self._redo_btn)
         toolbar.addWidget(self._clear_all_btn)
-        toolbar.addSpacing(12)
+        toolbar.addWidget(self._diff_btn)
         toolbar.addWidget(self._polish_btn)
-        toolbar.addWidget(self._custom_btn)
         toolbar.addStretch(1)
 
-        # --- Custom row (hidden by default) --------------------------------
-        # Shown only when the Custom button is toggled on. While visible AND
-        # focused, dictation routes here instead of into the top pane (see
-        # append_dictation). ⌘↵ submits, ↑/↓ at the text boundaries cycle
-        # through history, Esc closes the row.
+        # --- always-on Custom prompt row -----------------------------------
+        # The prompt field is permanent: no toggle, no reveal animation, no
+        # mode switch. It coexists with the preset pills above as the second
+        # always-available entry point ("type and ⌘↵" vs "click a pill").
+        # Dictation routes here whenever this field has focus; otherwise it
+        # lands in the top pane (see append_dictation).
         self._custom_input = _CustomPromptEdit()
         self._custom_input.setPlaceholderText(
             "Prompt — ⌘↵ to run, ↑/↓ history"
         )
-        # Compact, fixed height — about two comfortable lines of text. Long
-        # instructions scroll internally rather than ballooning the row.
-        self._custom_input.setFixedHeight(60)
+        # Height fits exactly two stacked icon buttons in the right-side
+        # strip (Apply on top, Clear below): 2 × ICON_BTN_SIZE + 4 spacing.
+        # Long instructions scroll internally rather than ballooning the row.
+        self._custom_input.setFixedHeight(2 * ICON_BTN_SIZE + 4)
         self._custom_input.setFrameShape(QPlainTextEdit.Shape.NoFrame)
         self._custom_input.setStyleSheet(_PROMPT_QSS)
         self._custom_input.submit.connect(self._run_custom)
-        self._custom_input.escape.connect(self._close_custom)
+        # Esc no longer closes the row (it's permanent now); it just bounces
+        # focus back to the top pane so the user can keep typing/dictating
+        # there without grabbing the mouse.
+        self._custom_input.escape.connect(self._focus_top)
         # Apply enables only when both source text and instruction are non-
         # empty — refresh on every keystroke so the button state tracks the
-        # field live.
+        # field live. The same refresh drives the prompt-clear button below.
         self._custom_input.textChanged.connect(self._refresh)
 
         self._apply_btn = icon_button(
             "play.fill", "▶", "Apply the Custom instruction (⌘↵)"
         )
         self._apply_btn.clicked.connect(self._run_custom)
+        # Local "clear this prompt" — outline trash to match the per-pane
+        # Clear glyph (filled trash stays the global clear-all). Enabled
+        # only when there's something to wipe; clicking never grabs focus
+        # (NoFocus on the button), so the keyboard caret stays where it was.
+        self._clear_prompt_btn = icon_button(
+            "trash", "Clr", "Clear the prompt field"
+        )
+        self._clear_prompt_btn.clicked.connect(self._custom_input.clear)
 
         self._custom_row = QWidget()
         custom_row_layout = QHBoxLayout(self._custom_row)
         custom_row_layout.setContentsMargins(0, 0, 0, 0)
-        # Match the panes' editor↔strip spacing exactly so the Custom row's
-        # input + apply column lines up with the panes' editor + strip column
-        # below — same FRAME_MARGIN gap, same 32 px button column on the
-        # right edge, same right margin to the window border.
+        # Match the panes' editor↔strip spacing exactly so the prompt row's
+        # input + button column lines up with the panes' editor + strip
+        # column above — same FRAME_MARGIN gap, same 32 px button column on
+        # the right edge, same right margin to the window border.
         custom_row_layout.setSpacing(FRAME_MARGIN)
         custom_row_layout.addWidget(self._custom_input, 1)
-        # Top-aligned so the icon sits at the top of the row, matching the
-        # panes' strip columns which also stack from the top (addStretch
-        # at the bottom).
-        custom_row_layout.addWidget(
-            self._apply_btn, 0, Qt.AlignmentFlag.AlignTop
-        )
-        self._custom_row.hide()
-        # Tracks whether we grew the window when Custom opened, so close can
-        # shrink it back by EXACTLY the same delta — not by snapping to a
-        # remembered absolute height. Restoring an absolute height was wrong:
-        # any manual resize the user did while Custom was open would be
-        # silently undone on close (they'd grow the window to read a long
-        # transform, close Custom, and lose all that height).
-        self._custom_grew_window = False
+        # Vertical strip on the right: Apply on top, Clear below. Same 4 px
+        # spacing as the per-pane strips so the visual rhythm matches across
+        # the window (every right-edge button column reads as the same shape).
+        prompt_strip = QVBoxLayout()
+        prompt_strip.setContentsMargins(0, 0, 0, 0)
+        prompt_strip.setSpacing(4)
+        prompt_strip.addWidget(self._apply_btn)
+        prompt_strip.addWidget(self._clear_prompt_btn)
+        custom_row_layout.addLayout(prompt_strip)
 
         layout = QVBoxLayout(self)
         # Even frame: window margin == editor↔strip gap == strip↔edge gap, so
@@ -796,12 +903,16 @@ class StudioWindow(QWidget):
         layout.setContentsMargins(FRAME_MARGIN, FRAME_MARGIN, FRAME_MARGIN, FRAME_MARGIN)
         layout.setSpacing(8)
         layout.addLayout(toolbar)
+        # Prompt row sits directly under the toolbar — Polish (a pill) and
+        # Custom (this field) are two equally-available entry points to the
+        # same transform, so they share the top of the window. Putting the
+        # field below the panes (chat-style) visually divorced it from the
+        # pill above, hiding the unification.
         layout.addWidget(self._custom_row)
         # stretch=1 — the splitter must absorb ALL extra vertical space so
         # the panes grow with the window. Without this stretch, QVBoxLayout
         # only gives the splitter its sizeHint (≈ sum of pane minimums) and
-        # the rest stays as empty space below — exactly what made the panes
-        # collapse on Custom toggle.
+        # the rest stays as empty space below.
         layout.addWidget(split, 1)
 
         self._transform_done.connect(self._on_transform_done)
@@ -811,6 +922,11 @@ class StudioWindow(QWidget):
         # the focused pane).
         QShortcut(QKeySequence.StandardKey.Undo, self, activated=self._undo)
         QShortcut(QKeySequence.StandardKey.Redo, self, activated=self._redo)
+        # ⌘D toggles the diff highlighting. Calling .toggle() through the
+        # button (not setting `_diff_enabled` directly) routes through the
+        # toggled() signal so the checkmark, persistence, and recompute all
+        # happen on one path.
+        QShortcut(QKeySequence("Ctrl+D"), self, activated=self._diff_btn.toggle)
 
         self._refresh()
 
@@ -830,11 +946,10 @@ class StudioWindow(QWidget):
 
     def append_dictation(self, text: str):
         """Append a freshly transcribed chunk into whichever field is active.
-        New dictation lands in the Custom prompt field if the user has it
-        open AND focused (so they can dictate the instruction itself);
-        otherwise it goes to the top pane (the default flow)."""
-        if (self._custom_row.isVisible()
-                and self._custom_input.hasFocus()):
+        Dictation lands in the Custom prompt field if it has focus (so the
+        user can dictate the instruction itself); otherwise it goes to the
+        top pane (the default flow)."""
+        if self._custom_input.hasFocus():
             self._append_to_custom(text)
             log.info("Studio: appended dictation to Custom (%d chars)",
                      len(text.strip()))
@@ -858,81 +973,21 @@ class StudioWindow(QWidget):
         self._custom_input.setTextCursor(cursor)
         self._custom_input.ensureCursorVisible()
 
-    # --- Custom row toggle -------------------------------------------------
-
-    def _on_custom_toggled(self, checked: bool):
-        """Slot for the Custom button's `toggled(bool)` signal. Bridges a
-        click to the right open/close path, and reverts the auto-toggle if
-        we can't honour it right now (mid-transform)."""
-        if self._transforming:
-            # Revert the auto-toggle Qt did on the click; without this the
-            # button would visually be in the new state while the row stayed
-            # in the old.
-            self._custom_btn.blockSignals(True)
-            self._custom_btn.setChecked(not checked)
-            self._custom_btn.blockSignals(False)
-            return
-        if checked:
-            self._open_custom()
-        else:
-            self._close_custom()
-
-    def _open_custom(self):
-        """Reveal the Custom prompt row and focus it (so dictation routes
-        there). Grow the window by exactly CUSTOM_EXTRA_PX so the row's
-        space is added rather than stolen from the panes; the matching
-        close-side shrink subtracts the same delta, so any manual resize
-        the user does while Custom is open is preserved on close.
-
-        Splitter sizes are snapshotted and restored on the next event-loop
-        tick (via QTimer.singleShot(0, ...)) — that's the key to keeping
-        pane heights stable across the open/close cycle. Without that
-        deferred restore, QSplitter eagerly redistributes between the
-        intermediate steps (show → resize → settle) and the panes drift to
-        a default 50/50 split. A direct setSizes() inline doesn't work
-        because the splitter hasn't finished its own resize handling yet."""
-        pane_sizes = self._split.sizes()
-        self._custom_row.show()
-        if not self._custom_grew_window:
-            self.resize(self.width(), self.height() + self.CUSTOM_EXTRA_PX)
-            self._custom_grew_window = True
-        QTimer.singleShot(0, lambda: self._split.setSizes(pane_sizes))
-        self._custom_input.setFocus()
-        self._refresh()
-
-    def _close_custom(self):
-        """Hide the Custom prompt row, shrink the window back by the SAME
-        delta we added on open, and return focus to the top pane.
-        Idempotent: callable from Esc inside the Custom field, the toggle
-        button, or anywhere else.
-
-        Same deferred snapshot/restore as _open_custom. The hide() releases
-        the row's space to the splitter, then resize() takes the same delta
-        back from the window — net zero on the panes, but only if the
-        intermediate redistribution doesn't leak. Restoring on the next
-        tick (after both events have been processed) keeps it from
-        leaking."""
-        pane_sizes = self._split.sizes()
-        self._custom_row.hide()
-        # Sync the button visual state without re-emitting toggled() (which
-        # would call us again).
-        self._custom_btn.blockSignals(True)
-        self._custom_btn.setChecked(False)
-        self._custom_btn.blockSignals(False)
-        if self._custom_grew_window:
-            self.resize(self.width(), self.height() - self.CUSTOM_EXTRA_PX)
-            self._custom_grew_window = False
-        QTimer.singleShot(0, lambda: self._split.setSizes(pane_sizes))
+    def _focus_top(self):
+        """Move keyboard focus to the top pane. Used by Esc inside the
+        prompt field to bounce back without grabbing the mouse."""
         self.top.editor.setFocus()
-        self._refresh()
 
     # --- transform (Phase 1 temporary slice) -------------------------------
 
-    def _start_transform(self, placeholder: str):
+    def _start_transform(self, placeholder: str, show_diff: bool = True):
         """Common pre-transform setup shared by Polish and Custom: reveal the
         result pane, lock it, show a placeholder, refresh button states. The
-        worker thread + signal plumbing is per-transform."""
+        worker thread + signal plumbing is per-transform. `show_diff` is
+        latched here so the live diff respects translate-style presets across
+        the worker's async boundary (Preset.show_diff = False)."""
         self._transforming = True
+        self._last_show_diff = show_diff
         if self.bottom.isHidden():
             self.bottom.show()              # reveal the result pane
             self._grow_for_two_panes()      # grow the short window to fit two
@@ -948,7 +1003,7 @@ class StudioWindow(QWidget):
         text = self.top.editor.toPlainText().strip()
         if not text or self._transforming:
             return
-        self._start_transform("Polishing…")
+        self._start_transform("Polishing…", show_diff=studio_llm.POLISH.show_diff)
         threading.Thread(
             target=self._polish_worker, args=(text,), daemon=True
         ).start()
@@ -975,7 +1030,10 @@ class StudioWindow(QWidget):
         # recallable for a retry.
         self._custom_input.remember(instruction)
         self._custom_input.clear()
-        self._start_transform("Applying…")
+        # Custom is the user-driven escape hatch. We can't introspect what
+        # they typed (translate? polish? rephrase?), so we leave the diff on
+        # by default — if it's noisy for their intent, they toggle it off.
+        self._start_transform("Applying…", show_diff=True)
         threading.Thread(
             target=self._custom_worker, args=(text, instruction), daemon=True
         ).start()
@@ -1000,6 +1058,80 @@ class StudioWindow(QWidget):
         self.bottom.controller.set_result(f"Transform failed: {message}")
         self._refresh()
 
+    # --- live diff highlighting -------------------------------------------
+
+    def _on_diff_toggled(self, checked: bool):
+        """Slot for the toolbar toggle (and ⌘D shortcut, which calls toggle()
+        on the same button). Persists the new state, then either repaints to
+        reflect the current panes or clears any standing highlights."""
+        self._diff_enabled = checked
+        _save_diff_enabled(checked)
+        if checked:
+            # Don't wait the debounce — the user just asked to see the diff,
+            # show it immediately.
+            self._recompute_diff_now()
+        else:
+            self._clear_diff_highlights()
+        log.info("Studio: diff highlighting %s", "on" if checked else "off")
+
+    def _request_diff_recompute(self):
+        """Schedule a diff repaint after a short debounce. Called from both
+        panes' on_any_change so manual typing, programmatic appends, and
+        transform results all converge on the same path. Cheap when nothing's
+        to do — the heavy work happens in _recompute_diff_now after the
+        timer fires."""
+        if not self._diff_enabled:
+            return
+        # Skip while a placeholder ("Polishing…") is showing — the user
+        # would otherwise see the placeholder text get diff-highlighted
+        # against the real top pane for one frame.
+        if self._transforming:
+            return
+        if not self._last_show_diff:
+            return
+        self._diff_timer.start()
+
+    def _recompute_diff_now(self):
+        """Repaint the live diff between the two panes against their CURRENT
+        text. Fully idempotent — clears the old highlights first, then paints
+        the fresh ones. Skipped when the comparison would be meaningless
+        (single-pane mode, toggle off, translate-style preset)."""
+        if not self._diff_enabled or self._transforming or not self._last_show_diff:
+            return
+        if self.bottom.isHidden():
+            return
+        before = self.top.editor.toPlainText()
+        after = self.bottom.editor.toPlainText()
+        self._apply_diff_highlights(before, after)
+
+    def _apply_diff_highlights(self, before: str, after: str):
+        """Compute spans and paint them. Always clears first so a shrinking
+        diff (e.g. user just edited the panes closer together) doesn't leave
+        stale tints behind."""
+        self._clear_diff_highlights()
+        if not before or not after:
+            return
+        deleted, inserted = diff_highlight.diff_spans(before, after)
+        if deleted:
+            self.top.controller.apply_format(
+                lambda e: diff_highlight.paint_background(
+                    e, deleted, diff_highlight.DELETED_BG
+                )
+            )
+        if inserted:
+            self.bottom.controller.apply_format(
+                lambda e: diff_highlight.paint_background(
+                    e, inserted, diff_highlight.INSERTED_BG
+                )
+            )
+
+    def _clear_diff_highlights(self):
+        """Remove any background tints from both panes. Wrapped in
+        apply_format so the format-only edits don't trigger another
+        recompute (loop guard)."""
+        self.top.controller.apply_format(diff_highlight.clear_background)
+        self.bottom.controller.apply_format(diff_highlight.clear_background)
+
     # --- chaining + explicit close ----------------------------------------
 
     def _use_as_input(self):
@@ -1020,6 +1152,10 @@ class StudioWindow(QWidget):
         as-is (hidden), so a later transform just overwrites it."""
         if self._transforming:
             return
+        # Strip diff tints from BOTH panes — comparison is meaningless with
+        # one pane, and an orphan red tint on the still-visible top would be
+        # confusing without its green counterpart on screen.
+        self._clear_diff_highlights()
         self.bottom.hide()
         if self._active is self.bottom:
             self._active = self.top
@@ -1103,6 +1239,12 @@ class StudioWindow(QWidget):
         self._apply_btn.setEnabled(
             bool(self.top.editor.toPlainText())
             and bool(self._custom_input.toPlainText().strip())
+            and not self._transforming)
+        # Prompt-clear is enabled only when there's something to wipe;
+        # never during a transform (the prompt is already cleared after a
+        # run and re-enabling the button mid-run reads as a no-op).
+        self._clear_prompt_btn.setEnabled(
+            bool(self._custom_input.toPlainText())
             and not self._transforming)
         self._use_btn.setEnabled(
             bool(self.bottom.editor.toPlainText()) and not self._transforming)
