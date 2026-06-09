@@ -206,6 +206,20 @@ class Bridge(QObject):
     # IS granted. Without these, the global hotkey doesn't fire and/or
     # auto-paste doesn't work; the overlay tells the user which to grant.
     permissions_needed = pyqtSignal(bool, bool)
+    # Studio LLM lazy-load lifecycle. Distinct from the Whisper preload
+    # signals because this fires on demand (when Dictate to Studio is
+    # toggled on for the first time), not at startup. The Studio window
+    # listens to refresh button enable states.
+    studio_model_state_changed = pyqtSignal()
+    # Studio LLM download UI is intentionally separate from the Whisper
+    # download signals — those drive the menubar yellow-status and the
+    # overlay progress bar (the "you can't dictate yet" state). Studio
+    # download must NEVER fall onto that path: dictation works regardless
+    # of whether the Studio model is here. Studio window listens to these
+    # and shows progress inside its own prompt-input placeholder.
+    studio_model_download_started = pyqtSignal()
+    studio_model_download_progress = pyqtSignal(int, int, int)
+    studio_model_download_finished = pyqtSignal()
 
 
 class OverlayWidget(QWidget):
@@ -582,6 +596,10 @@ class TellarApp:
         # poll loop tries when permissions land at runtime; whoever fires
         # first wins, the second call is a no-op.
         self._preload_started = False
+        # Same idea for the Studio LLM lazy load: first toggle of
+        # Dictate to Studio kicks the thread, subsequent toggles or
+        # menu actions skip if it's already in flight or done.
+        self._studio_preload_started = False
         # Instrumentation for chunked-transcription feasibility study.
         # _app_start_time anchors `since_startup_sec` in transcription_log
         # so we can later filter cold-JIT outliers (first 1-2 transcriptions
@@ -628,6 +646,23 @@ class TellarApp:
             self.overlay.hide_overlay()
         self.menubar.set_record_action_enabled(True)
         self.menubar.set_record_action_text("Start Recording  (⌃Space)")
+        # Once dictation is unblocked, idle-warm the mlx_lm import so the
+        # eventual Studio toggle skips its 9-sec cold-import cost. 2 sec
+        # gap leaves the disk/CPU free for any tail work the Whisper path
+        # is doing (warmup, kernel compile) before we touch the disk
+        # again. Fully invisible — no signals, no menubar status, no
+        # overlay; if the user dictates during the warmup, nothing about
+        # that flow changes.
+        QTimer.singleShot(2000, self._start_mlx_preimport)
+
+    def _start_mlx_preimport(self):
+        """Kick a one-shot worker thread that imports mlx_lm. Idempotent
+        via studio_llm._mlx_imported so a re-entrant call (e.g. if Whisper
+        gets re-readied for any reason) does no harm."""
+        threading.Thread(
+            target=studio_llm.preimport_mlx, daemon=True,
+            name="mlx-preimport",
+        ).start()
 
     def show_loading_state(self):
         """Coordinate overlay + menubar for the model-loading phase.
@@ -738,10 +773,61 @@ class TellarApp:
         threading.Thread(target=self._preload_model, daemon=True).start()
         log.info("Model preload thread started")
 
+    def _start_studio_preload(self):
+        """Lazy-load the Studio LLM. Called when the user first toggles
+        Dictate to Studio on; idempotent across subsequent toggles. Runs on
+        a worker thread, relays download progress through Studio-specific
+        signals (NOT the Whisper download path — dictation must not be
+        visually affected), and emits studio_model_state_changed when the
+        load completes (or fails) so the Studio window can refresh Polish /
+        Apply enable states.
+
+        Emits studio_model_state_changed up front too, so the Studio
+        prompt placeholder switches to "Loading…" the moment the user
+        toggles — without it, a cached fast load (which never enters the
+        download path) would silently disable Polish for ~1 sec with no
+        explanation."""
+        if self._studio_preload_started:
+            return
+        self._studio_preload_started = True
+        # Surface the load early — the placeholder updates on the next
+        # event-loop tick, before the worker even gets to mlx_lm.load().
+        self.bridge.studio_model_state_changed.emit()
+        threading.Thread(target=self._studio_preload_worker, daemon=True).start()
+        log.info("Studio LLM preload thread started")
+
+    def _studio_preload_worker(self):
+        import time
+        t0 = time.time()
+
+        download_started = False
+
+        def on_progress(pct, mb_done, mb_total):
+            nonlocal download_started
+            if not download_started:
+                download_started = True
+                self.bridge.studio_model_download_started.emit()
+            self.bridge.studio_model_download_progress.emit(pct, mb_done, mb_total)
+
+        try:
+            studio_llm.get_model(on_download_progress=on_progress)
+        except Exception:
+            log.exception("Studio LLM lazy load failed")
+            # Allow a future retry — on the next toggle we'll try again
+            # rather than staying broken silently for the rest of the run.
+            self._studio_preload_started = False
+            self.bridge.studio_model_state_changed.emit()
+            return
+
+        if download_started:
+            self.bridge.studio_model_download_finished.emit()
+        log.info("Studio LLM lazy load done in %.2fs", time.time() - t0)
+        self.bridge.studio_model_state_changed.emit()
+
     def _preload_model(self):
         import time
         t0 = time.time()
-        log.info("Preloading models (whisper + studio LLM)...")
+        log.info("Preloading whisper model...")
 
         download_started = False
 
@@ -757,15 +843,10 @@ class TellarApp:
             self.bridge.model_error.emit(str(e))
             return
 
-        # Studio LLM preload — mirrors the whisper flow and shares the same
-        # progress relay, so a fresh install shows both models downloading
-        # (two models now instead of one). A failure here must NOT mark the
-        # app broken: dictation still works, only Studio transforms would be
-        # unavailable.
-        try:
-            studio_llm.get_model(on_download_progress=on_progress)
-        except Exception:
-            log.exception("Studio LLM preload failed (Studio transforms disabled)")
+        # Studio LLM is no longer preloaded here — it's a lazy load triggered
+        # by toggling Dictate to Studio on (see _start_studio_preload). The
+        # default flow (dictation → instant paste) doesn't need it, so an
+        # ~8 GB model staying resident in RAM at startup made no sense.
 
         # Nudge the overlay "downloading" → "loading"/ready only if a download
         # actually happened (across either model); when both were cached the
@@ -999,9 +1080,15 @@ class TellarApp:
     def on_studio_changed(self, enabled: bool):
         """Menu callback when the Studio toggle flips. Visibility is coupled to
         routing: enabling shows the window (where dictations will land),
-        disabling hides it. Hiding preserves the editor content for next time."""
+        disabling hides it. Hiding preserves the editor content for next time.
+
+        Enabling also kicks off the Studio LLM lazy load (idempotent), so the
+        model is ready by the time the user starts running Polish/Custom.
+        Disabling does NOT unload — once it's in RAM, keep it there for the
+        rest of the session. Idle-unload is a separate (future) optimisation."""
         log.info("Studio mode toggled: %s", enabled)
         if enabled:
+            self._start_studio_preload()
             self.studio.show_panel()
         else:
             self.studio.hide()
@@ -1162,6 +1249,19 @@ def main():
     tellar.bridge.model_download_progress.connect(tellar.on_download_progress)
     tellar.bridge.model_download_finished.connect(tellar.on_download_finished)
     tellar.bridge.permissions_needed.connect(tellar.on_permissions_needed)
+    # Studio LLM lazy-load: refresh Polish / Apply enable states + the
+    # prompt placeholder when the model goes through download / load /
+    # ready transitions. The download signals are deliberately NOT the
+    # Whisper ones — dictation's overlay/menubar must not flicker because
+    # a Studio model is being fetched in the background.
+    tellar.bridge.studio_model_download_started.connect(
+        tellar.studio.on_model_download_started)
+    tellar.bridge.studio_model_download_progress.connect(
+        tellar.studio.on_model_download_progress)
+    tellar.bridge.studio_model_download_finished.connect(
+        tellar.studio.on_model_download_finished)
+    tellar.bridge.studio_model_state_changed.connect(
+        tellar.studio.on_model_state_changed)
 
     if not model_exists():
         log.info("Whisper model not found locally, will download once permissions OK")

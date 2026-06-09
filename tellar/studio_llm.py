@@ -150,6 +150,44 @@ PRESETS: list[Preset] = [POLISH]
 _model = None
 _tokenizer = None
 _loaded = False
+_mlx_imported = False
+
+
+def is_loaded() -> bool:
+    """True once get_model() has finished loading the model into memory.
+
+    UI code uses this to disable Polish / Apply while a lazy load is in
+    flight: the buttons reflect "you can run a transform" rather than
+    "you can request one" — clicking before load completes would block
+    the worker thread on get_model() with no visible feedback.
+    """
+    return _loaded
+
+
+def preimport_mlx():
+    """Pre-import mlx_lm in the background so the lazy get_model() doesn't
+    pay the ~9 sec cold-import cost when the user toggles Dictate to Studio.
+
+    Cheap (no weights allocated) and idempotent. Called from app.py once,
+    on idle after the Whisper preload is done — that timing keeps the
+    import off the critical path of first dictation while still being
+    almost certainly finished by the time the user opens Studio.
+
+    Logged so we can confirm in production that the warmup actually saves
+    the import time it claimed to in development.
+    """
+    global _mlx_imported
+    if _mlx_imported:
+        return
+    t0 = time.time()
+    try:
+        import mlx_lm  # noqa: F401 — side effect: cache the modules
+    except Exception:
+        log.exception("mlx_lm pre-import failed; lazy get_model will retry")
+        return
+    _mlx_imported = True
+    log.info("mlx_lm pre-imported in %.2fs (lazy get_model will skip this)",
+             time.time() - t0)
 
 
 def get_model(on_download_progress: hf_download.ProgressCallback = None):
@@ -158,21 +196,33 @@ def get_model(on_download_progress: hf_download.ProgressCallback = None):
     Mirrors transcriber.get_model: download (with progress) only if the
     snapshot is missing, then load into RAM. Called from the startup preload
     thread; transform() also calls it defensively in case it runs first.
+
+    Logs a per-phase timing breakdown so a slow load (~12s on Qwen-3B-4bit,
+    likely ~22-28s on Llama-8B-8bit) can be attributed to the right cause:
+    cold cache check, mlx_lm cold import, or the actual weight load.
     """
     global _model, _tokenizer, _loaded
     if _loaded:
         return
-    if not hf_download.snapshot_exists(STUDIO_LLM_MODEL):
+    t_cache = time.time()
+    cached = hf_download.snapshot_exists(STUDIO_LLM_MODEL)
+    log.info("Studio LLM cache check: %.2fs (cached=%s)",
+             time.time() - t_cache, cached)
+    if not cached:
         log.info("Studio LLM %s not in HF cache, downloading", STUDIO_LLM_MODEL)
         hf_download.set_hf_offline(False)
         hf_download.download_snapshot(STUDIO_LLM_MODEL, on_download_progress)
     hf_download.set_hf_offline(True)
-    t0 = time.time()
+    t_total = time.time()
     log.info("Loading Studio LLM %s into memory...", STUDIO_LLM_MODEL)
+    t_import = time.time()
     from mlx_lm import load
+    log.info("Studio LLM mlx_lm import: %.2fs", time.time() - t_import)
+    t_load = time.time()
     _model, _tokenizer = load(STUDIO_LLM_MODEL)
+    log.info("Studio LLM load(): %.2fs", time.time() - t_load)
     _loaded = True
-    log.info("Studio LLM loaded in %.2fs", time.time() - t0)
+    log.info("Studio LLM total %.2fs", time.time() - t_total)
 
 
 def build_chat_prompt(tokenizer, system: str, user: str):

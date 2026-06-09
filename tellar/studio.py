@@ -720,6 +720,13 @@ class StudioWindow(QWidget):
     DEFAULT_HEIGHT = 330
     TWO_PANE_HEIGHT = 690
 
+    # Default text shown in the prompt input when the model is loaded and
+    # the field is empty. The lazy-load lifecycle temporarily replaces this
+    # with status text ("Loading Studio model…", "Downloading 23%…") so the
+    # user sees what the disabled Polish / Apply are waiting on without us
+    # adding a separate spinner widget.
+    DEFAULT_PROMPT_PLACEHOLDER = "Prompt — ⌘↵ to run, ↑/↓ history"
+
     # Emitted from the transform worker thread back onto the Qt main thread
     # (cross-thread signals are delivered queued).
     _transform_done = pyqtSignal(str)
@@ -845,9 +852,7 @@ class StudioWindow(QWidget):
         # Dictation routes here whenever this field has focus; otherwise it
         # lands in the top pane (see append_dictation).
         self._custom_input = _CustomPromptEdit()
-        self._custom_input.setPlaceholderText(
-            "Prompt — ⌘↵ to run, ↑/↓ history"
-        )
+        self._custom_input.setPlaceholderText(self.DEFAULT_PROMPT_PLACEHOLDER)
         # Height fits exactly two stacked icon buttons in the right-side
         # strip (Apply on top, Clear below): 2 × ICON_BTN_SIZE + 4 spacing.
         # Long instructions scroll internally rather than ballooning the row.
@@ -977,6 +982,50 @@ class StudioWindow(QWidget):
         """Move keyboard focus to the top pane. Used by Esc inside the
         prompt field to bounce back without grabbing the mouse."""
         self.top.editor.setFocus()
+
+    # --- Studio LLM lazy-load lifecycle (Qt slots) ------------------------
+    # The owning TellarApp connects bridge.studio_model_* signals here; this
+    # window updates the prompt placeholder and re-runs _refresh so the
+    # disabled Polish / Apply enable as soon as the model is in RAM. The
+    # download signals are deliberately separate from the Whisper download
+    # signals — Studio loading must not affect dictation's UI.
+
+    def _set_prompt_placeholder(self, text: str):
+        """Update the prompt's placeholder and force a repaint.
+
+        QPlainTextEdit.setPlaceholderText caches the new text but Qt6
+        doesn't mark the viewport dirty, so the old placeholder lingers
+        until something else (focus change, resize) triggers a repaint.
+        Without this update(), the user toggles Dictate to Studio, sees
+        Polish go grey, but the placeholder still says "Prompt — ⌘↵…"
+        — confusing as "Loading…" when it's actually the stale default
+        showing through. Forcing the viewport repaint makes the status
+        change visible immediately."""
+        self._custom_input.setPlaceholderText(text)
+        self._custom_input.viewport().update()
+
+    def on_model_download_started(self):
+        self._set_prompt_placeholder("Downloading Studio model…")
+
+    def on_model_download_progress(self, pct: int, mb_done: int, mb_total: int):
+        self._set_prompt_placeholder(
+            f"Downloading Studio model — {pct}% ({mb_done} / {mb_total} MB)…"
+        )
+
+    def on_model_download_finished(self):
+        self._set_prompt_placeholder("Loading Studio model into RAM…")
+
+    def on_model_state_changed(self):
+        """Fired both when the lazy load kicks off and when it finishes
+        (or fails). Restores the default placeholder once the model is in
+        RAM; otherwise shows a generic "Loading…" hint so a cached load
+        — which never goes through the download path — still has SOME
+        text under the disabled Polish / Apply."""
+        if studio_llm.is_loaded():
+            self._set_prompt_placeholder(self.DEFAULT_PROMPT_PLACEHOLDER)
+        else:
+            self._set_prompt_placeholder("Loading Studio model…")
+        self._refresh()
 
     # --- transform (Phase 1 temporary slice) -------------------------------
 
@@ -1231,15 +1280,33 @@ class StudioWindow(QWidget):
         c = self._active.controller
         self._undo_btn.setEnabled(c.can_undo)
         self._redo_btn.setEnabled(c.can_redo)
-        # Polish runs the top pane; disabled while empty or mid-transform.
+        # Studio LLM is lazy-loaded — no transform can run until the model
+        # is in RAM. Surface the wait through Polish/Apply enable state +
+        # tooltip rather than a separate spinner; once loaded, tooltips
+        # revert to the action description.
+        model_ready = studio_llm.is_loaded()
+        loading_tip = "Loading Studio model…"
+        # Polish runs the top pane; disabled while empty, mid-transform, or
+        # mid-load.
         self._polish_btn.setEnabled(
-            bool(self.top.editor.toPlainText()) and not self._transforming)
+            bool(self.top.editor.toPlainText())
+            and not self._transforming
+            and model_ready)
+        self._polish_btn.setToolTip(
+            loading_tip if not model_ready
+            else "Polish — rewrite the text above (LLM) into the pane below"
+        )
         # Apply (Custom) needs BOTH a source text and a typed instruction.
         # While transforming, lock it like Polish.
         self._apply_btn.setEnabled(
             bool(self.top.editor.toPlainText())
             and bool(self._custom_input.toPlainText().strip())
-            and not self._transforming)
+            and not self._transforming
+            and model_ready)
+        self._apply_btn.setToolTip(
+            loading_tip if not model_ready
+            else "Apply the Custom instruction (⌘↵)"
+        )
         # Prompt-clear is enabled only when there's something to wipe;
         # never during a transform (the prompt is already cleared after a
         # run and re-enabling the button mid-run reads as a no-op).
