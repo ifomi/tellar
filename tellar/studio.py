@@ -1249,16 +1249,22 @@ class StudioWindow(QWidget):
         self._refresh()
 
     def _clear_all(self):
-        """Trash everything: clear both panes AND the prompt field at once.
-        Each pane clears as its own undo step (focus-based Undo restores
-        the focused pane). The prompt field is a transient input — no undo
-        history kept for it — so a wipe is final there. Like the per-pane
-        Clear, this does NOT collapse the split — only Close (×) does."""
+        """Trash everything: clear both panes AND the prompt field at once,
+        then fold the split back to a single field. Each pane clears as its
+        own undo step (focus-based Undo restores the focused pane). The
+        prompt field is a transient input — no undo history kept for it —
+        so a wipe is final there. Returns the window to the same state
+        as before the first transform: only the top pane and the prompt
+        are visible."""
         if self._transforming:
             return
         self.top.controller.clear()
         self.bottom.controller.clear()
         self._custom_input.clear()
+        # Fold the bottom pane away — same effect as Close (×). _close_bottom
+        # is a no-op if the split is already collapsed, so calling it
+        # unconditionally is safe.
+        self._close_bottom()
         self._refresh()
 
     def _grow_for_two_panes(self):
@@ -1300,6 +1306,35 @@ class StudioWindow(QWidget):
             # tick activateWindow has taken effect and the focus
             # actually lands.
             QTimer.singleShot(0, self.top.editor.setFocus)
+
+    def raise_silently(self):
+        """Bring the window above all other apps' windows WITHOUT stealing
+        keyboard focus. Used by the menubar menu-open hook: clicking the
+        Tellar icon opens the menu (which keeps tracking) AND surfaces
+        Studio at the same time. We can't use activateWindow / makeKey
+        here — that would dismiss the open NSMenu mid-tracking. Instead
+        we use NSWindow.orderFrontRegardless, which raises the window
+        across the app boundary but leaves the menu's first-responder
+        status intact. Once the user dismisses the menu, the now-visible
+        Studio is right there."""
+        if not self.isVisible():
+            self._place_default()
+            self.show()
+        try:
+            import objc
+            from AppKit import NSApp  # noqa: F401 — confirms AppKit is up
+            ns_view = objc.objc_object(c_void_p=int(self.winId()))
+            ns_window = ns_view.window() if ns_view else None
+            if ns_window is not None:
+                ns_window.orderFrontRegardless()
+            else:
+                # Fall back to Qt's raise_ — works within the same app's
+                # window stack at minimum, even if it can't lift across
+                # app boundaries in accessory mode.
+                self.raise_()
+        except Exception:
+            log.exception("raise_silently: orderFrontRegardless failed")
+            self.raise_()
 
     def closeEvent(self, event):
         """Closing the window leaves Studio routing: visibility is coupled to

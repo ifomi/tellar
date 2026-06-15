@@ -139,6 +139,22 @@ class _MenuController(NSObject):
         if app is not None:
             app.quit()
 
+    # NSMenuDelegate hook — fires the moment the user clicks the menubar
+    # icon, before the menu finishes drawing. We use it to bring the
+    # Studio window forward as a side effect of the same click that
+    # opens the menu, so the user never has to hunt for a Studio window
+    # buried under Safari/IDE. The callback uses orderFrontRegardless on
+    # the AppKit side, NOT activateWindow, so the open menu retains
+    # tracking — once the user dismisses it (Escape, click off), the
+    # already-raised Studio is right there.
+    def menuWillOpen_(self, menu):
+        fn = self._cb.get("menu_opening")
+        if fn:
+            try:
+                fn()
+            except Exception:
+                log.exception("menu_opening callback failed")
+
 
 class MenuBarIcon:
     """Public Pythonic API around NSStatusItem + NSMenu."""
@@ -146,6 +162,7 @@ class MenuBarIcon:
     def __init__(self, on_toggle: Callable[[], None],
                  on_auto_paste_changed: Optional[Callable[[bool], None]] = None,
                  on_studio_changed: Optional[Callable[[bool], None]] = None,
+                 on_menu_opening: Optional[Callable[[], None]] = None,
                  model_name: str = "?"):
         self._bar = NSStatusBar.systemStatusBar()
         # Variable length so the item resizes to fit a wide title (e.g. "0:01"
@@ -160,6 +177,7 @@ class MenuBarIcon:
             "toggle": on_toggle,
             "auto_paste_changed": on_auto_paste_changed,
             "studio_changed": on_studio_changed,
+            "menu_opening": on_menu_opening,
             "model_name": model_name,
         })
         # Keep strong reference so ARC doesn't deallocate
@@ -171,6 +189,9 @@ class MenuBarIcon:
         # setEnabled_(False). Turn it off so set_menu_busy can actually
         # grey out Auto Paste / Restart during model download.
         menu.setAutoenablesItems_(False)
+        # Hook menuWillOpen: in _MenuController so a menubar click can
+        # also bring the Studio window forward (see _MenuController.menuWillOpen_).
+        menu.setDelegate_(self._controller)
 
         # Status row at the top — disabled, used to surface what Tellar is
         # doing right now (downloading model, loading model, permissions

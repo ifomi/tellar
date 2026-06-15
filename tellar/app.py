@@ -1136,6 +1136,17 @@ class TellarApp:
             name="StudioLLM.Unload",
         ).start()
 
+    def on_menu_opening(self):
+        """Called by the menubar's NSMenuDelegate hook the moment the user
+        clicks the Tellar icon. We use it to surface the Studio window in
+        the same gesture that opens the menu — without it, a Studio window
+        buried under Safari/IDE forces the user to hunt through Mission
+        Control. raise_silently uses orderFrontRegardless rather than
+        activate, so the open menu retains tracking until the user
+        dismisses it; the now-visible Studio is right there."""
+        if self.menubar.is_studio_enabled() and self.studio is not None:
+            self.studio.raise_silently()
+
     def _finish(self):
         # Guard: this method is QTimer'd 1.5 sec after a transcription's
         # insert/route to flash the overlay green and reset the icon.
@@ -1268,9 +1279,11 @@ def main():
     # because TellarApp doesn't exist yet.
     _toggle_holder = [None]
     _studio_holder = [None]
+    _menu_opening_holder = [None]
     menubar = MenuBarIcon(
         on_toggle=lambda: _toggle_holder[0]() if _toggle_holder[0] else None,
         on_studio_changed=lambda enabled: _studio_holder[0](enabled) if _studio_holder[0] else None,
+        on_menu_opening=lambda: _menu_opening_holder[0]() if _menu_opening_holder[0] else None,
         model_name=MODEL_NAME,
     )
 
@@ -1289,6 +1302,7 @@ def main():
     tellar = TellarApp(menubar)
     _toggle_holder[0] = tellar.on_toggle
     _studio_holder[0] = tellar.on_studio_changed
+    _menu_opening_holder[0] = tellar.on_menu_opening
     tellar.attach_menubar()
 
     tellar.bridge.recording_started.connect(tellar._start_recording)
