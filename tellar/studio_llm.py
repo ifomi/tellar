@@ -153,6 +153,20 @@ _loaded = False
 _mlx_imported = False
 
 
+def _release_mlx_scratch():
+    """Drop MLX's free-cache pool after a generate() call. Same rationale
+    as transcriber._release_mlx_scratch — the LLM's per-call KV cache and
+    activation tensors otherwise stay resident under the cache pool. With
+    a 4-bit Qwen-3B that's an extra ~500 MB-1 GB stranded after every
+    transform; idle-unload (planned) will eventually drop the weights too,
+    but releasing scratch is the cheap baseline."""
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
 def is_loaded() -> bool:
     """True once get_model() has finished loading the model into memory.
 
@@ -162,6 +176,36 @@ def is_loaded() -> bool:
     the worker thread on get_model() with no visible feedback.
     """
     return _loaded
+
+
+def unload():
+    """Drop the loaded LLM weights and clear MLX scratch.
+
+    Called when the user turns Dictate to Studio off — without this the
+    ~1.5-2 GB Qwen-3B-4bit weights stay resident for the rest of the
+    process lifetime, which is what made memory climb sticky-up after
+    every Studio session in a long-running daemon. After unload, the
+    next transform() will trigger get_model() again (~12s reload from
+    the warm HF cache); the user already paid that cost on toggle-on,
+    so the symmetry is acceptable.
+
+    Safe to call while a transform() is mid-inference — Python ref
+    counting keeps the model object alive until generate() returns;
+    we just clear the module-level handles so future calls reload."""
+    global _model, _tokenizer, _loaded
+    if not _loaded and _model is None:
+        return
+    log.info("Unloading Studio LLM (was loaded=%s)", _loaded)
+    _model = None
+    _tokenizer = None
+    _loaded = False
+    try:
+        import gc
+        gc.collect()
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        log.exception("Studio LLM unload cleanup failed (non-fatal)")
 
 
 def preimport_mlx():
@@ -268,6 +312,7 @@ def transform(text: str, preset: Preset) -> str:
         "Studio transform '%s': %d chars -> %d chars in %.2fs",
         preset.key, len(text), len(out), time.time() - t0,
     )
+    _release_mlx_scratch()
     return _strip_preamble(out)
 
 
@@ -298,6 +343,7 @@ def transform_custom(text: str, instruction: str) -> str:
         "-> %d chars in %.2fs",
         len(text), len(instruction), len(out), time.time() - t0,
     )
+    _release_mlx_scratch()
     return _strip_preamble(out)
 
 

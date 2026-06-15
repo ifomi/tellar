@@ -1100,24 +1100,41 @@ class TellarApp:
         routing: enabling shows the window (where dictations will land),
         disabling hides it. Hiding preserves the editor content for next time.
 
-        Enabling also kicks off the Studio LLM lazy load (idempotent), so the
-        model is ready by the time the user starts running Polish/Custom.
-        Disabling does NOT unload — once it's in RAM, keep it there for the
-        rest of the session. Idle-unload is a separate (future) optimisation."""
+        Enabling kicks off the Studio LLM lazy load (idempotent) so the model
+        is ready by the time the user runs Polish/Custom. Disabling unloads
+        the model — the 1.5-2 GB of weights would otherwise stay resident for
+        the rest of the daemon's lifetime even though the user has signalled
+        they're done with Studio for now. Re-enable pays the ~12s reload cost
+        again, which is the same cost the user already accepted on the first
+        toggle-on, so the symmetry is fair."""
         log.info("Studio mode toggled: %s", enabled)
         if enabled:
             self._start_studio_preload()
             self.studio.show_panel()
         else:
             self.studio.hide()
+            self._unload_studio_llm()
 
     def _on_studio_window_closed(self):
         """The user closed the Studio window via its title bar. Treat it as
         turning Studio off: uncheck the menu item and re-enable Auto Paste.
-        set_studio_enabled doesn't re-trigger on_studio_changed, so this won't
-        loop back into hide()."""
+        set_studio_enabled doesn't re-trigger on_studio_changed, so we run
+        the unload here too — otherwise closing via the X leaves the LLM
+        weights resident, while toggling via the menu would unload them."""
         log.info("Studio window closed by user; disabling Studio routing")
         self.menubar.set_studio_enabled(False)
+        self._unload_studio_llm()
+
+    def _unload_studio_llm(self):
+        """Drop Studio LLM weights + reset the preload guard so the next
+        toggle-on triggers a fresh load through the standard placeholder →
+        Loading… → ready UX path. Runs the unload itself on a background
+        thread to keep the menu/UI responsive (gc.collect can take ~50ms)."""
+        self._studio_preload_started = False
+        threading.Thread(
+            target=studio_llm.unload, daemon=True,
+            name="StudioLLM.Unload",
+        ).start()
 
     def _finish(self):
         # Guard: this method is QTimer'd 1.5 sec after a transcription's

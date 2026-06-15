@@ -17,6 +17,17 @@ log = get_logger(__name__)
 MODEL_NAME = "mlx-community/whisper-large-v3-turbo"
 MODEL_DIR = Path.home() / "Library" / "Application Support" / "Tellar" / "models"
 
+# Cap on MLX's free-cache pool. MLX retains scratch buffers (mel spec,
+# encoder hidden, decoder KV) between transcribe calls for reuse — without
+# a cap, the pool grows to the high-water mark of the longest chunk ever
+# seen and never shrinks for the life of the process. Over a multi-day
+# uptime that pool was observed at 6+ GB, swapping the model weights out
+# and dragging individual transcriptions to 12s on 7s of audio.
+# 256 MB is enough to keep one chunk's scratch hot; everything beyond
+# that is discarded on the next allocation. Pair with mx.clear_cache()
+# in pipeline.py after each chunk for steady-state behaviour.
+MLX_CACHE_LIMIT_BYTES = 256 * 1024 * 1024
+
 # Feature flag for the chunked-transcription pipeline. When False (default),
 # _stop_recording transcribes the full WAV in one mlx_whisper call — the
 # pre-migration behavior. When True, the recording is sliced into 30s chunks
@@ -205,7 +216,22 @@ CHUNKED_TRANSCRIPTION = True
 #                        applied after clean_hallucinations on every
 #                        transcribe path (chunks + chunked-assembly +
 #                        full-WAV fallback + flag-off path).
-TRANSCRIPTION_VARIANT = "chunked_rolling_v12_hallucination_filter"
+#   chunked_rolling_v13_temp0 —
+#                        v12 + transcribe_chunk pins temperature=0.0,
+#                        disabling whisper's temperature-fallback retry
+#                        cascade. Telemetry on a single-speaker, stable
+#                        setup showed bimodal per-chunk latency: ~0.1x
+#                        realtime when the first decode passes thresholds,
+#                        but ~1x (10x slower) when avg_logprob dips below
+#                        logprob_threshold (-1.0) and whisper re-decodes
+#                        the whole 30s window at rising temperatures up to
+#                        6x. Content-dependent, hence the same speech
+#                        varying wildly run-to-run. The pipeline already
+#                        has its own degenerate detector + full-WAV
+#                        fallback, so whisper's internal retry is largely
+#                        redundant. EXPERIMENT — comparing latency/quality
+#                        vs v12 via per-variant telemetry.
+TRANSCRIPTION_VARIANT = "chunked_rolling_v13_temp0"
 
 # Variant tag used by app.py when CHUNKED_TRANSCRIPTION=False, i.e. when
 # the entire chunked pipeline is bypassed and transcribe_audio() is
@@ -275,6 +301,16 @@ def get_model(on_download_progress: ProgressCallback = None):
     log.info("Loading model %s into memory...", MODEL_NAME)
     load_model(MODEL_NAME)
     log.info("Model loaded in %.2fs", time.time() - t1)
+    # Cap MLX's free-cache pool so scratch buffers don't accumulate over
+    # the multi-day uptime of a daemon process. Idempotent — safe to call
+    # before any mlx_whisper.transcribe(). See MLX_CACHE_LIMIT_BYTES.
+    try:
+        import mlx.core as mx
+        prev = mx.set_cache_limit(MLX_CACHE_LIMIT_BYTES)
+        log.info("MLX cache limit set: %d -> %d bytes",
+                 prev, MLX_CACHE_LIMIT_BYTES)
+    except Exception:
+        log.exception("Failed to set MLX cache limit (non-fatal)")
     _model_loaded = True
 
 
@@ -323,6 +359,22 @@ def _load_wav_mono16k(path: str) -> np.ndarray:
     return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def _release_mlx_scratch():
+    """Drop MLX's free-cache pool after a transcribe call. MLX retains
+    scratch buffers (mel spec, encoder hidden, decoder KV) between calls
+    for reuse — without explicit release the pool grows to the high-water
+    mark of the largest chunk and never shrinks for the life of the
+    process. Over multi-day uptimes this was observed at 6+ GB, swapping
+    weights out under memory pressure and dragging individual chunks to
+    12s on 7s of audio. Best-effort: wrapped so a non-Metal fallback path
+    never breaks transcription."""
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
 def transcribe_audio(audio_path: str) -> str:
     """Full-WAV transcribe with the project's standard prompt + threshold
     tuning. Used by the flag-off code path (CHUNKED_TRANSCRIPTION=False)
@@ -351,6 +403,7 @@ def transcribe_audio(audio_path: str) -> str:
         compression_ratio_threshold=2.0,
     )
     text = result.get("text", "").strip()
+    _release_mlx_scratch()
     return remove_hallucinations(clean_hallucinations(text))
 
 
@@ -378,6 +431,7 @@ def transcribe_audio_defaults(audio_path: str) -> str:
     audio = _load_wav_mono16k(audio_path)
     result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL_NAME)
     text = result.get("text", "").strip()
+    _release_mlx_scratch()
     return remove_hallucinations(clean_hallucinations(text))
 
 
@@ -425,6 +479,13 @@ def transcribe_chunk(audio: np.ndarray, initial_prompt: Optional[str] = None) ->
         # output (compression ratio >> 2.4 means actual repetition loops)
         # without firing on every awkward boundary.
         compression_ratio_threshold=2.4,
+        # v13 — single temperature, no fallback cascade. The default
+        # schedule re-decodes the whole window up to 6x when avg_logprob
+        # dips below logprob_threshold, which on a stable single-speaker
+        # setup caused ~10x run-to-run latency swings. The pipeline's own
+        # degenerate detector + full-WAV fallback covers genuine failures.
+        temperature=0.0,
     )
     text = result.get("text", "").strip()
+    _release_mlx_scratch()
     return remove_hallucinations(clean_hallucinations(text))
