@@ -100,6 +100,28 @@ _DIRTY_ENDINGS = ('...', '…')
 # marker. Strip it defensively before storing chunk text.
 _LEADING_CONTINUATION_RE = re.compile(r'^\s*[.…]{2,}\s*')
 
+# Symmetric strip from the END of the chunk text. Whisper's internal
+# segmenter marks the last segment of a chunk as "to be continued" and
+# emits "..." even when the human didn't pause meaningfully — the
+# acoustic finish of the chunk is enough of a cue for the model. With
+# fixed-30s cuts it was masked by mid-word boundaries; with VAD cuts
+# the chunk ends on a clean phrase, so the model emits the marker more
+# often, and it shows up between joined chunks as bogus "fragment...
+# next sentence". Apply ONLY to full chunks; tail (the last piece) is
+# whatever the user actually said at the end of the dictation, and
+# might legitimately end with "..." (rare but possible).
+_TRAILING_CONTINUATION_RE = re.compile(r'\s*[.…]{2,}\s*$')
+
+# Debug marker between joined chunks in the final output. When True,
+# pipeline.finalize() inserts a visible "⟨✂N: Ds reason⟩" tag at every
+# chunk boundary in the assembled text. Lets the user see in the
+# pasted/Studio output where chunk seams actually fall — useful for
+# diagnosing whether artifacts (e.g. "..." between sentences) are
+# emitted at chunk seams or somewhere else entirely. Strip via a
+# simple Find & Replace before sending the text anywhere it matters.
+# Diagnostic only — flip back to False once the question is settled.
+DEBUG_CHUNK_MARKERS = False
+
 
 class TranscriptionPipeline:
     def __init__(self, recorder: Recorder):
@@ -244,7 +266,26 @@ class TranscriptionPipeline:
                 )
             else:
                 ordered = [self._results[i] for i in range(self._chunk_idx)]
-                joined = " ".join(part for part in ordered if part)
+                if DEBUG_CHUNK_MARKERS:
+                    parts: List[str] = []
+                    for i, text in enumerate(ordered):
+                        if text:
+                            parts.append(text)
+                        # Marker after every chunk except the last —
+                        # the last chunk's end IS the end of the dictation.
+                        if i < len(ordered) - 1:
+                            duration = (
+                                self._chunk_durations_s[i]
+                                if i < len(self._chunk_durations_s) else 0.0
+                            )
+                            reason = (
+                                self._chunk_cut_reasons[i]
+                                if i < len(self._chunk_cut_reasons) else "?"
+                            )
+                            parts.append(f"⟨✂{i}: {duration:.2f}s {reason}⟩")
+                    joined = " ".join(parts)
+                else:
+                    joined = " ".join(part for part in ordered if part)
                 log.info("Pipeline finalize: assembled from %d chunks (%d chars)",
                          self._chunk_idx, len(joined))
                 self._finalize_path = "assembled"
@@ -288,17 +329,36 @@ class TranscriptionPipeline:
         Lazy-init the ChunkingBuffer with the device rate (only known
         after the device is probed inside Recorder.start)."""
         if self._buffer is None:
-            self._buffer = ChunkingBuffer(source_rate=source_rate)
-            log.info("Pipeline: ChunkingBuffer initialized at %d Hz", source_rate)
+            from .transcriber import VAD_CHUNKING
+            if VAD_CHUNKING:
+                from .chunking_vad import ChunkingBufferVAD
+                self._buffer = ChunkingBufferVAD(source_rate=source_rate)
+                log.info(
+                    "[VAD-CHUNKER] Pipeline initialized at %d Hz — "
+                    "silero-vad natural-pause cuts ACTIVE (v14)",
+                    source_rate,
+                )
+            else:
+                self._buffer = ChunkingBuffer(source_rate=source_rate)
+                log.info(
+                    "[fixed-30s] Pipeline initialized at %d Hz — "
+                    "fixed 30s cuts (v13 baseline)",
+                    source_rate,
+                )
         for chunk_audio, cut_reason in self._buffer.push(frame_bytes):
             assert self._queue is not None
             duration = len(chunk_audio) / TARGET_RATE
             self._queue.put((self._chunk_idx, chunk_audio, True))
             self._chunk_durations_s.append(duration)
             self._chunk_cut_reasons.append(cut_reason)
+            # Visible marker so live-test logs make it obvious which
+            # chunker is running — VAD cuts (vad/force_max) vs fixed-30s
+            # (fixed). cut_reason "tail" only comes from stop_capture,
+            # not this loop, so we don't need to handle it here.
+            marker = "VAD" if cut_reason in ("vad", "force_max") else "fixed-30s"
             log.info(
-                "Pipeline: emitted chunk %d (%.2fs, cut=%s, qsize=%d)",
-                self._chunk_idx, duration, cut_reason, self._queue.qsize(),
+                "Pipeline [%s]: emitted chunk %d (%.2fs, cut=%s, qsize=%d)",
+                marker, self._chunk_idx, duration, cut_reason, self._queue.qsize(),
             )
             self._chunk_idx += 1
 
@@ -324,6 +384,14 @@ class TranscriptionPipeline:
                 # VAD-cut chunks this is rare — chunks start at clean
                 # speech onset — but keep the strip as belt-and-suspenders.
                 text = _LEADING_CONTINUATION_RE.sub('', text)
+                # Symmetric trailing strip — only for full chunks, not
+                # tail. Whisper's segmenter routinely emits "..." at the
+                # END of the last segment in a chunk as a "to be
+                # continued" cue, which on joined chunks shows up as
+                # spurious mid-text ellipses (the artifact users see
+                # between sentences after VAD cuts).
+                if is_full_chunk:
+                    text = _TRAILING_CONTINUATION_RE.sub('', text)
                 results[idx] = text
                 elapsed = time.time() - t0
                 transcribe_secs[idx] = elapsed
@@ -339,26 +407,26 @@ class TranscriptionPipeline:
                         idx, len(text), DEGENERATE_CHAR_THRESHOLD,
                     )
                     continue
-                # Smart rolling prompt: only carry forward if the chunk
-                # text ends with a real sentence terminator AND is not a
-                # whisper "..." / "…" hallucination. Otherwise reset so
-                # the next chunk gets a clean PUNCTUATION_PROMPT instead
-                # of inheriting mid-thought / hallucinated context.
-                stripped = text.rstrip()
-                clean_ending = (
-                    stripped
-                    and not stripped.endswith(_DIRTY_ENDINGS)
-                    and stripped.endswith(_CLEAN_TERMINATORS)
-                )
-                if clean_ending:
+                # Rolling prompt: carry forward the tail of every
+                # non-degenerate chunk, regardless of how it ended.
+                # Earlier versions (v8-v13) only carried forward when
+                # the chunk ended with .!? — defensive measure from
+                # the era when temperature-fallback retry cascades
+                # could produce poisonous prompts. With v12 hallucinations
+                # filter, v13 temperature=0, v14 VAD-cut chunks (clean
+                # speech onset) and the trailing "..." strip above,
+                # degenerate-cascade risk is low enough that the cost
+                # of resetting outweighs the benefit. Cost: when VAD
+                # cuts mid-sentence (intra-thought pause), reset means
+                # the next chunk has no context — whisper treats it as
+                # a fresh utterance, capitalizes the first word, and
+                # the joined output reads as two sentences instead of
+                # one continuous thought. Carrying the tail through
+                # gives whisper enough context to continue lower-case
+                # and grammatically agreeing with the previous chunk.
+                if text.strip():
                     last_prompt = text[-ROLLING_PROMPT_CHARS:]
                 else:
-                    if last_prompt is not None:
-                        log.info(
-                            "Pipeline: chunk %d ends without clean terminator — "
-                            "resetting rolling prompt for chunk %d",
-                            idx, idx + 1,
-                        )
                     last_prompt = None
                     counters["rolling_resets"] = counters.get("rolling_resets", 0) + 1
             except Exception:

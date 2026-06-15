@@ -95,7 +95,8 @@ PIP_INDEX="https://pypi.apple.com/simple/"
     "pyobjc-framework-Cocoa>=10.0" \
     "pyobjc-framework-Quartz>=10.0" \
     "pyobjc-framework-ApplicationServices>=10.0" \
-    "pyaudio>=0.2"
+    "pyaudio>=0.2" \
+    "onnxruntime>=1.20"
 
 # --- 5b. Patch mlx_whisper for lazy timing import ---
 # transcribe.py eagerly imports .timing at module load, which pulls in scipy
@@ -136,6 +137,18 @@ done
 # would otherwise trip the external-deps audit below.
 echo "==> Removing unused PyQt6 plugins"
 rm -rf "$SITE/PyQt6/Qt6/plugins/sqldrivers"
+
+# Prune onnxruntime sub-packages we never import. We use only the
+# inference session for silero VAD (chunking_vad.py → vad.py:
+# onnxruntime.InferenceSession + SessionOptions). The shipping wheel
+# also contains tooling packages (transformers helpers, quantization
+# utilities, conversion tools, sample datasets, generic backend
+# bindings) — none touched on Tellar's runtime path. Removing saves
+# ~4 MB and avoids carrying code we don't ship behaviourally.
+echo "==> Pruning unused onnxruntime sub-packages"
+for sub in transformers quantization tools datasets backend; do
+    rm -rf "$SITE/onnxruntime/$sub" 2>/dev/null || true
+done
 
 # --- 6c. Bundle external dylibs that pip-installed C extensions reference ---
 # Some Python C extensions (notably pyaudio's _portaudio.so) are compiled

@@ -17,6 +17,7 @@ dependencies = [
     "pyobjc-framework-Quartz>=10.0",
     "pyaudio>=0.2",
     "numpy>=1.24",
+    "onnxruntime>=1.20",
 ]
 
 [project.scripts]

@@ -231,7 +231,30 @@ CHUNKED_TRANSCRIPTION = True
 #                        fallback, so whisper's internal retry is largely
 #                        redundant. EXPERIMENT — comparing latency/quality
 #                        vs v12 via per-variant telemetry.
-TRANSCRIPTION_VARIANT = "chunked_rolling_v13_temp0"
+#   chunked_rolling_v14_silero_vad —
+#                        v13 + chunking switched from fixed-30s cuts to
+#                        silero-vad natural-pause cuts (chunking_vad.py).
+#                        Re-attempt of the v10 idea that previously failed
+#                        for two reasons we now address structurally:
+#                        (1) v10 used RMS-threshold "silence" detection,
+#                        which never fires under realistic background
+#                        noise — silero is a small NN that classifies
+#                        speech vs non-speech and ignores hum/breath/
+#                        keyboard. (2) v10 left trailing silence inside
+#                        the chunk → whisper interpreted it as "end of
+#                        show" and emitted "Продолжение следует..."
+#                        replacing the chunk's tail; we now trim trailing
+#                        silence to last_speech_end + 100ms before
+#                        emitting, so whisper sees a chunk that ends
+#                        mid-utterance acoustically (no EOS cue). The
+#                        v12 hallucinations.py filter remains as a
+#                        belt-and-suspenders catch.
+#                        Activated by VAD_CHUNKING=True below.
+VAD_CHUNKING = True
+TRANSCRIPTION_VARIANT = (
+    "chunked_rolling_v14_silero_vad" if VAD_CHUNKING
+    else "chunked_rolling_v13_temp0"
+)
 
 # Variant tag used by app.py when CHUNKED_TRANSCRIPTION=False, i.e. when
 # the entire chunked pipeline is bypassed and transcribe_audio() is
