@@ -187,11 +187,53 @@ class ChunkingBufferVAD:
         return emitted
 
     def flush(self) -> np.ndarray:
-        """Return whatever's in the chunk buffer right now as a tail.
-        Caller (pipeline.stop_capture) labels it 'tail' for telemetry.
+        """Return the tail buffer with trailing silence trimmed off.
+
+        This is symmetric with _emit_cut for full chunks: we cut at
+        last_speech_end + TRIM_PAD_S so whisper sees a chunk that ends
+        mid-utterance acoustically, without the trailing pause that
+        triggers "end of show" hallucinations like "Спасибо за просмотр".
+
+        The fix matters even for long tails (10+ seconds of real
+        speech). Whisper's training data is dominated by YouTube videos
+        with ritual sign-offs ("Thanks for watching", "Спасибо за
+        просмотр", "Subscribe..."), and the model treats *any*
+        acoustic fade-out as a cue to emit one. By trimming the trailing
+        silence we remove the cue. Without this, every dictation with
+        even 100-300ms of silence between the last word and the stop
+        button risks getting "Спасибо" appended.
+
+        Empty tail (no speech detected in the buffer) returns a
+        zero-length array — pipeline.stop_capture handles that case
+        by not enqueuing a tail chunk at all, so whisper isn't invoked
+        on pure silence/noise (the #1 hallucination trigger).
+
         Resets state so a re-use of the buffer starts clean (we don't
-        currently do that, but cheap to be defensive)."""
-        tail = self._chunk_audio
+        currently do that, but cheap to be defensive).
+        """
+        original_len = len(self._chunk_audio)
+        if self._last_speech_end_sample is None:
+            log.info(
+                "[VAD-CHUNKER] flush: no speech in %.2fs tail buffer — "
+                "returning empty (skipping whisper to avoid hallucination)",
+                _samples_to_seconds(original_len),
+            )
+            tail = np.empty(0, dtype=np.float32)
+        else:
+            cut_at = min(
+                self._last_speech_end_sample + self._trim_pad_samples,
+                original_len,
+            )
+            log.info(
+                "[VAD-CHUNKER] flush: tail trimmed %.2fs -> %.2fs "
+                "(last_speech_end=%.2fs, dropped %.2fs of trailing silence)",
+                _samples_to_seconds(original_len),
+                _samples_to_seconds(cut_at),
+                _samples_to_seconds(self._last_speech_end_sample),
+                _samples_to_seconds(original_len - cut_at),
+            )
+            tail = self._chunk_audio[:cut_at].copy()
+
         self._reset_chunk_state()
         self._vad.reset()
         self._ratecv_state = None
