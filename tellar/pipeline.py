@@ -266,6 +266,23 @@ class TranscriptionPipeline:
                 )
             else:
                 ordered = [self._results[i] for i in range(self._chunk_idx)]
+                # Reconcile chunk-boundary inconsistencies. Whisper at the
+                # end of chunk N sometimes adds a sentence terminator
+                # (it "thinks" the segment is ending acoustically), while
+                # whisper at the start of chunk N+1 — which sees N's tail
+                # as rolling prompt context — outputs a lowercase first
+                # letter, treating it as continuation. The two decisions
+                # contradict; N+1 has more context, so trust it and drop
+                # the spurious terminator from N before joining.
+                for i in range(len(ordered) - 1):
+                    if not ordered[i] or not ordered[i + 1]:
+                        continue
+                    prev_stripped = ordered[i].rstrip()
+                    curr_stripped = ordered[i + 1].lstrip()
+                    if not prev_stripped or not curr_stripped:
+                        continue
+                    if prev_stripped[-1] in '.!?' and curr_stripped[0].islower():
+                        ordered[i] = prev_stripped[:-1].rstrip()
                 if DEBUG_CHUNK_MARKERS:
                     parts: List[str] = []
                     for i, text in enumerate(ordered):

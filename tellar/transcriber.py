@@ -250,9 +250,29 @@ CHUNKED_TRANSCRIPTION = True
 #                        v12 hallucinations.py filter remains as a
 #                        belt-and-suspenders catch.
 #                        Activated by VAD_CHUNKING=True below.
+#   chunked_rolling_v15_suffix_punctuation —
+#                        v14 + flips the prompt order in transcribe_chunk:
+#                        rolling_text + ' ' + PUNCTUATION_PROMPT instead
+#                        of PUNCTUATION_PROMPT + ' ' + rolling_text. The
+#                        prefix layout from v14 didn't break the
+#                        punctuation-loss cascade we'd been chasing —
+#                        whisper's decoder weights the END of the prompt
+#                        as the most recent style cue, and a
+#                        terminator-less rolling tail at the end of the
+#                        prompt would push subsequent chunks toward
+#                        unpunctuated output regardless of the
+#                        PUNCTUATION_PROMPT prefix. With the suffix
+#                        layout, every chunk gets a period-terminated
+#                        style anchor as the freshest token before
+#                        decoding starts. Verified via offline replay
+#                        harness (tools/replay_chunked.py) on 13 saved
+#                        problem dictations: cascade eliminated on 9/10
+#                        reproducible cases, zero regressions. Also
+#                        bumped NATURAL_PAUSE_S from 0.5 → 0.6 in
+#                        chunking_vad.py to reduce mid-thought VAD cuts.
 VAD_CHUNKING = True
 TRANSCRIPTION_VARIANT = (
-    "chunked_rolling_v14_silero_vad" if VAD_CHUNKING
+    "chunked_rolling_v15_suffix_punctuation" if VAD_CHUNKING
     else "chunked_rolling_v13_temp0"
 )
 
@@ -467,13 +487,29 @@ def transcribe_chunk(audio: np.ndarray, initial_prompt: Optional[str] = None) ->
     proper-noun spelling, capitalization and punctuation style consistent
     across chunk boundaries (the standard whisper-streaming pattern).
 
-    Note: we tried prepending PUNCTUATION_PROMPT to the rolling prompt
-    to restore punctuation bias on chunk boundaries, but it tripped
-    whisper's compression_ratio_threshold retry cascade (the
-    style-mismatched concatenation produced degenerate decoder output
-    → retries at higher temperatures → 3-5x per-chunk slowdown AND
-    worse final quality because the retries also lose punctuation).
-    Rolling-only is the lesser evil.
+    Prompt composition for rolling chunks:
+        rolling_text + ' ' + PUNCTUATION_PROMPT
+
+    Order matters: whisper's decoder treats the END of the prompt as
+    the most recent style cue. By placing PUNCTUATION_PROMPT after the
+    rolling tail, every chunk receives a fresh punctuation/capitalization
+    anchor regardless of how the previous chunk's tail looked. The
+    earlier prefix layout (PUNCTUATION_PROMPT first, then rolling) let
+    a terminator-less rolling tail dominate as the freshest style cue,
+    which cascaded "no punctuation" forward across all subsequent
+    chunks once a single chunk drifted.
+
+    A short-lived v2 experiment (2026-05-27) tried adding the
+    PUNCTUATION_PROMPT to the rolling prompt and was reverted: the
+    style-mismatched concatenation tripped whisper's
+    compression_ratio_threshold + temperature-fallback retry cascade,
+    causing 3-5x per-chunk slowdown AND worse output. v13 pinned
+    temperature=0.0 — disabling that retry cascade — so the v2 failure
+    mode no longer applies. v14 brought the prepend back as prefix; on
+    13 saved problem dictations the prefix layout failed to break the
+    cascade. v15 (2026-06-17) flips to suffix layout based on A/B
+    replay results: cascade eliminated on 9/10 reproducible cases,
+    zero regressions. See tools/replay_chunked.py for the harness.
 
     Returns the cleaned text (post hallucination filter). Returns "" for
     an empty ndarray (zero-length tail on a stop that landed exactly on
@@ -483,12 +519,24 @@ def transcribe_chunk(audio: np.ndarray, initial_prompt: Optional[str] = None) ->
         return ""
     _set_hf_offline(True)
     import mlx_whisper
-    # Rolling prompt (chunks 1+ with clean handoff) is passed through
-    # untouched — vocab would compete with meaningful per-chunk context
-    # for the ~224-token prompt budget. Vocab attaches only to the
-    # PUNCTUATION_PROMPT default path: chunk 0, and chunks 1+ where the
-    # previous chunk ended without a clean terminator (rolling reset).
-    prompt = initial_prompt if initial_prompt else _with_vocabulary(PUNCTUATION_PROMPT)
+    if initial_prompt:
+        # Rolling context first, PUNCTUATION_PROMPT last. Order matters:
+        # whisper's decoder weights the END of the prompt as the most
+        # recent style cue. With PUNCTUATION_PROMPT in the suffix
+        # position, every chunk gets a fresh, period-terminated style
+        # anchor regardless of whether the rolling tail itself ended
+        # with a terminator. The prefix-position layout used previously
+        # let a terminator-less rolling tail dominate as the most
+        # recent style cue, cascading "no punctuation" forward across
+        # the rest of the recording.
+        # Vocabulary skipped here — the rolling tail already carries
+        # chunk-specific named entities through, and adding the vocab
+        # list would crowd the ~224-token prompt budget.
+        prompt = initial_prompt + ' ' + PUNCTUATION_PROMPT
+    else:
+        # Chunk 0: no rolling context, so vocab attaches to the style
+        # hint to bias proper nouns from the user's vocabulary.txt.
+        prompt = _with_vocabulary(PUNCTUATION_PROMPT)
     result = mlx_whisper.transcribe(
         audio,
         path_or_hf_repo=MODEL_NAME,

@@ -73,13 +73,14 @@ HARD_CUT_S = 28.0
 MIN_SPEECH_S = 5.0
 
 # Continuous non-speech run that qualifies as a natural cut point.
-# 500 ms — slightly above the typical intra-sentence pause (200-400 ms
+# 600 ms — slightly above the typical intra-sentence pause (200-400 ms
 # for emphasis or word-search) and below the typical inter-sentence
 # pause (700+ ms). Cutting at 400 ms ripped logical sentences in half
-# at intra-thought pauses; with 500 ms we should cut closer to actual
-# sentence boundaries, while force_max picks up the slack when a
-# single burst genuinely runs past 28s without any pause that long.
-NATURAL_PAUSE_S = 0.5
+# at intra-thought pauses; 500 ms reduced that but still cut mid-thought
+# in some recordings. 600 ms is the next conservative step — moves
+# closer to actual sentence boundaries while leaving force_max to pick
+# up bursts that genuinely run past 28s without any pause that long.
+NATURAL_PAUSE_S = 0.6
 
 # Padding kept after last_speech_end before the cut. Defends against
 # clipping the final consonant of a word; small enough that whisper
