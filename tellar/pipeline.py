@@ -47,6 +47,7 @@ per-chunk durations / cut reasons / transcribe times / char counts,
 plus aggregate counters (rolling resets, finalize path).
 """
 
+import os
 import queue
 import re
 import threading
@@ -55,6 +56,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from . import pnc
 from .chunking import ChunkingBuffer, TARGET_RATE
 from .hallucinations import remove_hallucinations
 from .recorder import Recorder
@@ -63,6 +65,11 @@ from .transcriber import transcribe_audio_defaults, transcribe_chunk, clean_hall
 from .logging_setup import get_logger
 
 log = get_logger(__name__)
+
+# P&C layer toggle (dev): default ON. Set TELLAR_PNC=0 to compare against raw
+# v16 stitching without the re-punctuation pass. Gated to multi-chunk dictations
+# in finalize() — single-chunk output has no seams and is left as whisper made it.
+PNC_ENABLED = os.environ.get("TELLAR_PNC", "1") != "0"
 
 # Last N chars of chunk N's text become the initial_prompt for chunk N+1.
 # Whisper's prompt budget is ~224 tokens (~600-1000 chars depending on
@@ -145,6 +152,13 @@ class TranscriptionPipeline:
         self._chunk_transcribe_secs: Dict[int, float] = {}
         self._worker_counters: Dict[str, int] = {"rolling_resets": 0}
         self._finalize_path: str = ""
+        # Whether the P&C layer ran on the last finalize (per-record telemetry).
+        self._pnc_applied: bool = False
+
+        # Warm the P&C model off the critical path so the first multi-chunk
+        # finalize doesn't stall while a ~266 MB model loads. Idempotent.
+        if PNC_ENABLED:
+            threading.Thread(target=pnc.warm, daemon=True).start()
 
     @property
     def wav_path(self) -> Optional[str]:
@@ -178,6 +192,7 @@ class TranscriptionPipeline:
             "degenerate_chunk_indices": sorted(self._degenerate_indices),
             "rolling_prompt_resets": self._worker_counters.get("rolling_resets", 0),
             "finalize_path": self._finalize_path,
+            "pnc_applied": self._pnc_applied,
         }
 
     def start(self):
@@ -192,6 +207,7 @@ class TranscriptionPipeline:
         self._chunk_transcribe_secs = {}
         self._worker_counters = {"rolling_resets": 0}
         self._finalize_path = ""
+        self._pnc_applied = False
         self._queue = queue.Queue()
         # Capture queue/results/degenerate/transcribe_secs/counters in args
         # so an orphaned worker (cancel + restart) writes to its own dead
@@ -303,7 +319,15 @@ class TranscriptionPipeline:
                 log.info("Pipeline finalize: assembled from %d chunks (%d chars)",
                          self._chunk_idx, len(joined))
                 self._finalize_path = "assembled"
-                return remove_hallucinations(clean_hallucinations(joined))
+                result = remove_hallucinations(clean_hallucinations(joined))
+                # P&C layer (variant C): re-derive punctuation/case over the
+                # whole text so per-chunk seam formatting cannot survive.
+                # Gated to multi-chunk (single chunk has no seams) and skipped
+                # under DEBUG_CHUNK_MARKERS (the ⟨✂⟩ markers would confuse it).
+                if PNC_ENABLED and not DEBUG_CHUNK_MARKERS and self._chunk_idx > 1:
+                    result = pnc.apply_pnc(result)
+                    self._pnc_applied = True
+                return result
 
         log.info("Pipeline finalize: using fallback transcribe_audio_defaults")
         self._last_fallback_used = True

@@ -63,7 +63,7 @@ DIAGNOSTIC_MODE = True
 # version is running. The value here is for the dev/diagnostic instance —
 # the production /Applications/Tellar.app keeps DIAGNOSTIC_MODE=False
 # and never shows this label.
-BUILD_LABEL = "v16-late-cut"
+BUILD_LABEL = "v17-pnc-full"
 
 # Idle-state menubar icon tint. Yellow when running in diagnostic mode
 # so the dev/diag instance is visually distinct from the production

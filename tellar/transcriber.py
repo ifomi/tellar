@@ -288,7 +288,7 @@ CHUNKED_TRANSCRIPTION = True
 #                        far-rarer remaining seams. No dictionary added.
 VAD_CHUNKING = True
 TRANSCRIPTION_VARIANT = (
-    "chunked_rolling_v16_late_cut" if VAD_CHUNKING
+    "chunked_rolling_v17_pnc_late_cut" if VAD_CHUNKING
     else "chunked_rolling_v13_temp0"
 )
 
