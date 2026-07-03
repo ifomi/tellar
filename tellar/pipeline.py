@@ -58,6 +58,7 @@ import numpy as np
 from .chunking import ChunkingBuffer, TARGET_RATE
 from .hallucinations import remove_hallucinations
 from .recorder import Recorder
+from .seams import reconcile_seams, vocabulary_word_set
 from .transcriber import transcribe_audio_defaults, transcribe_chunk, clean_hallucinations
 from .logging_setup import get_logger
 
@@ -158,7 +159,8 @@ class TranscriptionPipeline:
         """Snapshot for telemetry. Only meaningful after finalize().
         All lists are 1:1 with chunk indices except chunk_chars which
         derives from results."""
-        chunk_chars = [len(self._results.get(i, "")) for i in range(self._chunk_idx)]
+        chunk_texts = [self._results.get(i, "") for i in range(self._chunk_idx)]
+        chunk_chars = [len(t) for t in chunk_texts]
         chunk_t = [round(self._chunk_transcribe_secs.get(i, 0.0), 3) for i in range(self._chunk_idx)]
         return {
             "n_chunks": self._chunk_idx,
@@ -166,6 +168,13 @@ class TranscriptionPipeline:
             "chunk_cut_reasons": list(self._chunk_cut_reasons),
             "chunk_transcribe_secs": chunk_t,
             "chunk_chars": chunk_chars,
+            # Per-chunk text BEFORE the finalize() join/terminator-drop —
+            # the raw seam material. Lets offline tools locate chunk
+            # boundaries in the final text and classify join defects
+            # (boundary duplication, false capital, missing separator)
+            # without re-running the WAV. Privacy-sensitive (it is the
+            # transcript), so app.py drops it outside DIAGNOSTIC_MODE.
+            "chunk_texts": chunk_texts,
             "degenerate_chunk_indices": sorted(self._degenerate_indices),
             "rolling_prompt_resets": self._worker_counters.get("rolling_resets", 0),
             "finalize_path": self._finalize_path,
@@ -266,23 +275,11 @@ class TranscriptionPipeline:
                 )
             else:
                 ordered = [self._results[i] for i in range(self._chunk_idx)]
-                # Reconcile chunk-boundary inconsistencies. Whisper at the
-                # end of chunk N sometimes adds a sentence terminator
-                # (it "thinks" the segment is ending acoustically), while
-                # whisper at the start of chunk N+1 — which sees N's tail
-                # as rolling prompt context — outputs a lowercase first
-                # letter, treating it as continuation. The two decisions
-                # contradict; N+1 has more context, so trust it and drop
-                # the spurious terminator from N before joining.
-                for i in range(len(ordered) - 1):
-                    if not ordered[i] or not ordered[i + 1]:
-                        continue
-                    prev_stripped = ordered[i].rstrip()
-                    curr_stripped = ordered[i + 1].lstrip()
-                    if not prev_stripped or not curr_stripped:
-                        continue
-                    if prev_stripped[-1] in '.!?' and curr_stripped[0].islower():
-                        ordered[i] = prev_stripped[:-1].rstrip()
+                # Reconcile chunk-boundary inconsistencies before joining:
+                # spurious terminators, words duplicated across a seam, and
+                # false capitals where a mid-sentence pause was rendered as
+                # a new sentence. See tellar/seams.py for the full rationale.
+                ordered = reconcile_seams(ordered, vocabulary_word_set())
                 if DEBUG_CHUNK_MARKERS:
                     parts: List[str] = []
                     for i, text in enumerate(ordered):

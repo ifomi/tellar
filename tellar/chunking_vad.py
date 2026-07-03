@@ -67,10 +67,19 @@ SAMPLE_WIDTH = 2  # int16
 HARD_CUT_S = 28.0
 
 # Don't even try to find a natural cut until the chunk has at least
-# this much accumulated SPEECH (silence doesn't count). Avoids cutting
-# after the first phrase when more is clearly coming. Keeps chunks
-# meaty enough that whisper's per-chunk overhead amortizes.
-MIN_SPEECH_S = 5.0
+# this much accumulated SPEECH (silence doesn't count). This is the
+# floor that keeps chunks BIG: with HARD_CUT_S=28 just above it, the
+# policy becomes "accumulate ~22s of speech, then cut at the very next
+# pause" — so chunks land at ~24-28s wall-clock (speech + interleaved
+# micro-pauses), each holding a whole stretch of a sentence, and the
+# counter RESETS after every cut so the next cut needs another ~22s.
+# This is the lever that fixes the "рваность": at 5.0s we cut after the
+# first pause past 5s of speech, fragmenting sentences into ~9s pieces
+# and multiplying chunk-seam artifacts (cap/dup/punctuation). At 22s,
+# ~67% of dictations (<28s) become a SINGLE chunk with no seam at all.
+# Must stay a few seconds BELOW HARD_CUT_S: if it reaches 28 there is no
+# window left to snap to a pause and every cut degrades to a hard cut.
+MIN_SPEECH_S = 22.0
 
 # Continuous non-speech run that qualifies as a natural cut point.
 # 600 ms — slightly above the typical intra-sentence pause (200-400 ms

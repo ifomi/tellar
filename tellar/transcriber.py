@@ -270,9 +270,25 @@ CHUNKED_TRANSCRIPTION = True
 #                        reproducible cases, zero regressions. Also
 #                        bumped NATURAL_PAUSE_S from 0.5 → 0.6 in
 #                        chunking_vad.py to reduce mid-thought VAD cuts.
+#   chunked_rolling_v16_late_cut —
+#                        v15 + raises MIN_SPEECH_S in chunking_vad.py from
+#                        5s to 22s. Telemetry showed the v14/v15 chunker
+#                        cut after the FIRST pause past 5s of speech →
+#                        median chunk 9.5s, ~742 seams total, 80% of chunks
+#                        <15s. That over-fragmentation was the root cause
+#                        of the "рваность" and the whole class of chunk-
+#                        seam artifacts (false capitals, boundary word
+#                        duplication, stray punctuation) we'd been patching
+#                        in finalize(). At 22s the policy becomes "fill the
+#                        chunk to ~24-28s, then snap the cut to the next
+#                        pause" — so ~67% of dictations (<28s) become a
+#                        SINGLE seamless chunk, and long ones roughly halve
+#                        their chunk count. seams.py reconcile (TERM/DUP/
+#                        CAP) stays as a cheap belt-and-suspenders for the
+#                        far-rarer remaining seams. No dictionary added.
 VAD_CHUNKING = True
 TRANSCRIPTION_VARIANT = (
-    "chunked_rolling_v15_suffix_punctuation" if VAD_CHUNKING
+    "chunked_rolling_v16_late_cut" if VAD_CHUNKING
     else "chunked_rolling_v13_temp0"
 )
 

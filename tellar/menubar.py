@@ -163,7 +163,8 @@ class MenuBarIcon:
                  on_auto_paste_changed: Optional[Callable[[bool], None]] = None,
                  on_studio_changed: Optional[Callable[[bool], None]] = None,
                  on_menu_opening: Optional[Callable[[], None]] = None,
-                 model_name: str = "?"):
+                 model_name: str = "?",
+                 dev_label: Optional[str] = None):
         self._bar = NSStatusBar.systemStatusBar()
         # Variable length so the item resizes to fit a wide title (e.g. "0:01"
         # timer text). Square length clipped multi-character titles.
@@ -192,6 +193,21 @@ class MenuBarIcon:
         # Hook menuWillOpen: in _MenuController so a menubar click can
         # also bring the Studio window forward (see _MenuController.menuWillOpen_).
         menu.setDelegate_(self._controller)
+
+        # Permanent dev/diagnostic header at the very top of the menu.
+        # Visible only when running a non-production build (caller passes
+        # dev_label only in that case). Disabled — purely informational.
+        # Sits above the dynamic status row so the build identity is the
+        # FIRST thing the user sees on every menu open, even when there's
+        # also a transient status to surface.
+        if dev_label:
+            self._dev_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                dev_label, "", ""
+            )
+            self._dev_item.setEnabled_(False)
+            menu.addItem_(self._dev_item)
+            menu.addItem_(NSMenuItem.separatorItem())
+            self._item.button().setToolTip_(f"Tellar — {dev_label}")
 
         # Status row at the top — disabled, used to surface what Tellar is
         # doing right now (downloading model, loading model, permissions

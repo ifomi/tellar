@@ -49,6 +49,29 @@ TRANSCRIPTION_LOG_CHUNKED = STATE_DIR / "transcription_log_chunked.jsonl"
 SAMPLES_DIR = STATE_DIR / "samples"
 
 
+# When True, every dictation is archived: the WAV goes to SAMPLES_DIR
+# under sample_<id>_<dur>s.wav, the transcribed text gets a " [#<id>]"
+# trailer before emit, and the transcription log row gains id/text/wav
+# fields. Together these three layers let us reconstruct any past
+# recording — replay it through different prompt strategies, models or
+# chunkers — by grepping the marker (or text) in the user's clipboard
+# history. Off by default; user toggles for bursts of diagnostic data.
+DIAGNOSTIC_MODE = True
+
+# Human-readable build identifier shown in the menu when DIAGNOSTIC_MODE
+# is on. Bump it as we iterate so a glance at the menu confirms which
+# version is running. The value here is for the dev/diagnostic instance —
+# the production /Applications/Tellar.app keeps DIAGNOSTIC_MODE=False
+# and never shows this label.
+BUILD_LABEL = "v16-late-cut"
+
+# Idle-state menubar icon tint. Yellow when running in diagnostic mode
+# so the dev/diag instance is visually distinct from the production
+# build at a glance, without overloading the existing color semantics
+# for recording (orange) / error (red) / done (green).
+IDLE_ICON_COLOR = "#ffd84d" if DIAGNOSTIC_MODE else "#ffffff"
+
+
 # Path to the brand silhouette used as the menubar icon. The PNG is a
 # pre-rendered alpha mask (transparent background, opaque black where the
 # Tellar t+wave shape is), generated from assets/icon.png — see the
@@ -636,7 +659,7 @@ class TellarApp:
 
     def on_model_ready(self):
         self._ready = True
-        self.menubar.set_icon_pixmap(_make_wave_pixmap("#ffffff"))
+        self.menubar.set_icon_pixmap(_make_wave_pixmap(IDLE_ICON_COLOR))
         self.menubar.set_status_text("")
         self.menubar.set_menu_busy(False)
         # Don't override the permissions_needed overlay — model loading
@@ -916,7 +939,7 @@ class TellarApp:
             self.recorder.cleanup()
         self._target_app = None
         self.overlay.hide_overlay()
-        self.menubar.set_icon_pixmap(_make_wave_pixmap("#ffffff"))
+        self.menubar.set_icon_pixmap(_make_wave_pixmap(IDLE_ICON_COLOR))
         self.menubar.set_record_action_text("Start Recording  (⌃Space)")
 
     def _start_recording(self):
@@ -951,7 +974,7 @@ class TellarApp:
         if not wav_path:
             log.info("WAV empty (silence trimmed below threshold), aborting transcription")
             self.overlay.hide_overlay()
-            self.menubar.set_icon_pixmap(_make_wave_pixmap("#ffffff"))
+            self.menubar.set_icon_pixmap(_make_wave_pixmap(IDLE_ICON_COLOR))
             self._recording = False
             return
 
@@ -964,6 +987,12 @@ class TellarApp:
         def process():
             import time
             t0 = time.time()
+            # Stable id for this dictation. Used to link the saved WAV,
+            # the JSONL log row, and the " [#<id>]" marker glued to
+            # the emitted text. unix_ts is unique enough at one-second
+            # granularity, sortable, and matches the existing
+            # sample_<ts>_*s.wav filename convention.
+            record_id = int(t0)
             try:
                 if CHUNKED_TRANSCRIPTION:
                     text = self.pipeline.finalize()
@@ -971,23 +1000,39 @@ class TellarApp:
                     text = transcribe_audio(wav_path)
                 duration = time.time() - t0
                 log.info("Transcription done in %.2fs, %d chars", duration, len(text))
-                try:
-                    self._append_transcription_log(wav_path, duration, len(text))
-                except Exception:
-                    log.exception("transcription_log append failed")
-                if os.environ.get("TELLAR_SAVE_WAVS") == "1" or (
-                    CHUNKED_TRANSCRIPTION and self.pipeline.last_fallback_used
+                # Save WAV BEFORE writing the log row so the log can
+                # cite the saved filename (the file exists on disk by
+                # the time the log line is flushed).
+                wav_dest = None
+                if (
+                    DIAGNOSTIC_MODE
+                    or os.environ.get("TELLAR_SAVE_WAVS") == "1"
+                    or (CHUNKED_TRANSCRIPTION and self.pipeline.last_fallback_used)
                 ):
                     try:
-                        self._save_sample_wav(wav_path)
+                        wav_dest = self._save_sample_wav(wav_path, record_id)
                     except Exception:
                         log.exception("sample WAV save failed")
+                try:
+                    self._append_transcription_log(
+                        wav_path,
+                        duration,
+                        len(text),
+                        record_id=record_id if DIAGNOSTIC_MODE else None,
+                        text=text if DIAGNOSTIC_MODE else None,
+                        wav_filename=(wav_dest.name if wav_dest and DIAGNOSTIC_MODE else None),
+                    )
+                except Exception:
+                    log.exception("transcription_log append failed")
                 if CHUNKED_TRANSCRIPTION:
                     self.pipeline.cleanup()
                 else:
                     self.recorder.cleanup()
                 if text.strip():
-                    self.bridge.transcription_done.emit(text.strip())
+                    out = text.strip()
+                    if DIAGNOSTIC_MODE:
+                        out = f"{out} [#{record_id}]"
+                    self.bridge.transcription_done.emit(out)
                 else:
                     log.info("Transcription returned empty text")
                     self.bridge.transcription_empty.emit()
@@ -997,12 +1042,25 @@ class TellarApp:
 
         threading.Thread(target=process, daemon=True).start()
 
-    def _append_transcription_log(self, wav_path: str, transcribe_sec: float, chars: int):
+    def _append_transcription_log(
+        self,
+        wav_path: str,
+        transcribe_sec: float,
+        chars: int,
+        *,
+        record_id: Optional[int] = None,
+        text: Optional[str] = None,
+        wav_filename: Optional[str] = None,
+    ):
         """Append one JSONL row capturing the (audio_duration, transcribe_duration)
         pair for offline analysis. POSIX append() of a sub-PIPE_BUF line is
         atomic, so concurrent writes from sequential _stop_recording calls
         don't need a lock. Failure here must not break the user-visible
         transcription flow — caller wraps in try/except.
+
+        record_id/text/wav_filename are populated only in DIAGNOSTIC_MODE,
+        producing a self-contained record that lets us replay any past
+        dictation without grepping multiple files.
         """
         import json
         import time
@@ -1020,12 +1078,23 @@ class TellarApp:
             "first_after_warmup": self._transcribe_count == 1,
             "variant": TRANSCRIPTION_VARIANT if CHUNKED_TRANSCRIPTION else BASELINE_VARIANT,
         }
+        if record_id is not None:
+            record["id"] = record_id
+        if text is not None:
+            record["text"] = text
+        if wav_filename is not None:
+            record["wav"] = wav_filename
         # Merge pipeline diagnostics when chunked path was used.
         # last_run_stats is meaningful only after pipeline.finalize() —
         # silent on flag-off path.
         if CHUNKED_TRANSCRIPTION:
             try:
                 record.update(self.pipeline.last_run_stats)
+                # chunk_texts is the transcript split per chunk — same
+                # privacy class as `text`, so keep it only in diagnostic
+                # builds (gated identically to record_id/text/wav).
+                if record_id is None:
+                    record.pop("chunk_texts", None)
             except Exception:
                 log.exception("could not collect pipeline stats")
         log_path = TRANSCRIPTION_LOG_CHUNKED if CHUNKED_TRANSCRIPTION else TRANSCRIPTION_LOG_BASELINE
@@ -1033,21 +1102,21 @@ class TellarApp:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def _save_sample_wav(self, wav_path: str):
+    def _save_sample_wav(self, wav_path: str, record_id: int) -> Path:
         """Copy the just-recorded WAV into SAMPLES_DIR for later A/B baseline
-        replay. Called only when TELLAR_SAVE_WAVS=1. Filename encodes the
-        unix timestamp and audio duration so we can pick out long samples
-        for chunked-transcription validation. Caller wraps in try/except.
+        replay. Filename encodes record_id and audio duration so we can pick
+        out long samples and join with transcription_log entries by id.
+        Returns the destination Path. Caller wraps in try/except.
         """
         import shutil
-        import time
         import wave
         with wave.open(wav_path, "rb") as wf:
             audio_sec = wf.getnframes() / wf.getframerate()
         SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-        dest = SAMPLES_DIR / f"sample_{int(time.time())}_{int(round(audio_sec))}s.wav"
+        dest = SAMPLES_DIR / f"sample_{record_id}_{int(round(audio_sec))}s.wav"
         shutil.copyfile(wav_path, dest)
         log.info("Saved sample WAV: %s", dest)
+        return dest
 
     def _insert_result(self, text):
         log.info("Insert: enter, _recording -> False (t=%.3f)", time.monotonic())
@@ -1164,7 +1233,7 @@ class TellarApp:
             return
         log.info("_finish: enter (t=%.3f)", time.monotonic())
         self.overlay.hide_overlay()
-        self.menubar.set_icon_pixmap(_make_wave_pixmap("#ffffff"))
+        self.menubar.set_icon_pixmap(_make_wave_pixmap(IDLE_ICON_COLOR))
         self._recording = False
         self.menubar.set_record_action_text("Start Recording  (⌃Space)")
         log.info("_finish: done, ready for new hotkey (t=%.3f)",
@@ -1285,6 +1354,7 @@ def main():
         on_studio_changed=lambda enabled: _studio_holder[0](enabled) if _studio_holder[0] else None,
         on_menu_opening=lambda: _menu_opening_holder[0]() if _menu_opening_holder[0] else None,
         model_name=MODEL_NAME,
+        dev_label=f"DEV · {BUILD_LABEL} · diagnostic" if DIAGNOSTIC_MODE else None,
     )
 
     app = QApplication(sys.argv)
