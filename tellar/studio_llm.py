@@ -1,23 +1,23 @@
 """Tellar Studio LLM — local text transformations via mlx-lm.
 
-Studio presets ("Polish", "Email", "Formal"…) rewrite the text in the top
-pane and drop the result in the bottom pane. This module is the engine: it
-loads a local instruct model through mlx-lm and exposes transform(text, preset).
+Studio applies a user-typed CUSTOM instruction to the text in the top pane and
+drops the result in the bottom pane (grammar-fix, translate, summarize, …).
+This module is the engine: it loads a local instruct model through mlx-lm and
+exposes transform_custom(text, instruction). (transform(text, preset) and the
+fixed presets below are retained only for the offline A/B tooling — the app no
+longer surfaces preset buttons; Studio is custom-prompt only.)
 
-Decoupled from the UI — Studio calls transform() on a background thread and
-gets the result via a Qt signal. The model is NOT loaded on import; it is
-preloaded into RAM at app startup alongside the Whisper model (see
-app.py:_preload_model), mirroring the Whisper flow. On a fresh install both
-models download from HF Hub with the shared throttled progress UX
-(hf_download), so the first launch shows two models downloading instead of one.
+Decoupled from the UI — Studio calls transform_custom() on a background thread
+and gets the result via a Qt signal. The model is NOT loaded on import and NOT
+preloaded at startup: it lazy-loads when the user first opens Studio
+(app.py:_start_studio_preload) and unloads when the window closes
+(app.py:_unload_studio_llm). On a fresh install the model downloads from HF Hub
+with the throttled progress UX (hf_download).
 
 Model choice is a single constant: STUDIO_LLM_MODEL. The engine is model-
-agnostic — it drives any instruct model that ships a chat template, so swapping
-models (A/B comparison, see plans/studio-llm.md §2) is a one-line change.
-
-This is Phase 1: lazy-download + load + transform() + one hardcoded "Polish"
-preset. The full preset registry, Custom prompt, focus-based undo and the
-two-pane UI layer on in later phases.
+agnostic — it drives any instruct model that ships a chat template (build_chat_
+prompt folds the system turn into the user turn for templates without a system
+role, e.g. Gemma), so swapping models is a one-line change.
 """
 import time
 from dataclasses import dataclass
@@ -27,16 +27,17 @@ from .logging_setup import get_logger
 
 log = get_logger(__name__)
 
-# Single point of model choice. Swap to compare models (plans/studio-llm.md §2).
-# Staying on 3B for now. We tried Qwen2.5-7B-Instruct-4bit (2026-05-31): better
-# filler removal and cleaner single-language polish, BUT not a clean win — it
-# still failed the same Russian declension ("Встреча перенесли"), and on mixed-
-# language input it leaked Chinese into the output (Qwen multilingual quirk),
-# whereas 3B silently dropped a chunk. Neither handles mixed-language in one
-# pass; that case is out of scope for v1. The 7B cost (~4.5 GB, slower) didn't
-# justify the partial gain, so we reverted. Revisit model choice in Phase 5.
-# Other A/B candidates: Qwen3-4B-Instruct-2507-4bit, gemma-3-4b-it-qat-4bit.
-STUDIO_LLM_MODEL = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+# Single point of model choice. Swap to compare models.
+# CHOSEN 2026-07-05 after a custom-prompt bake-off (5 models × 15 cases, see
+# Obsidian/Tellar/Studio custom bakeoff.md): gemma-3-4b-it-qat-4bit is the best
+# fit for the custom-prompt Studio — it corrects grammar well AND stays faithful
+# (highest word-overlap, does not restructure), best at distill, and — unlike in
+# the old Polish-preset test — does NOT flip EN→RU when the instruction says to
+# keep the language. Qwen2.5-3B (previous) was fastest but under-corrected;
+# Ministral-8B corrected slightly more but occasionally substituted words;
+# bigger (gemma-2-9b / aya-8b) gave no gain or over-rewrote. Speed is not
+# critical for an on-demand transform, so ~2s is fine.
+STUDIO_LLM_MODEL = "mlx-community/gemma-3-4b-it-qat-4bit"
 
 
 @dataclass(frozen=True)

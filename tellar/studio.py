@@ -856,25 +856,17 @@ class StudioWindow(QWidget):
         self._diff_btn.setChecked(self._diff_enabled)
         self._diff_btn.toggled.connect(self._on_diff_toggled)
 
-        # The single fixed preset for now (Phase 1). Custom prompt lives in
-        # its own always-on row at the bottom of the window — there's no
-        # toggle; the field and the pill coexist as two equally-available
-        # entry points. The sparkles glyph mirrors what Apple Intelligence
-        # uses for its Writing Tools (Polish / Rewrite / Make Friendly), so
-        # it reads as "AI tidies up the text" at a glance.
-        self._polish_btn = icon_button(
-            "sparkles", "✨",
-            "Polish — rewrite the text above (LLM) into the pane below",
-        )
-        self._polish_btn.clicked.connect(self._run_polish)
-
+        # Studio is CUSTOM-PROMPT ONLY: the free-form instruction row at the
+        # bottom is the single entry point. Fixed presets (Polish) were removed
+        # — a curated custom prompt does polish/translate/summarize and more,
+        # without the per-preset prompt-tuning treadmill. The toolbar keeps
+        # only the shared controls (undo/redo/clear-all/diff).
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
         toolbar.addWidget(self._undo_btn)
         toolbar.addWidget(self._redo_btn)
         toolbar.addWidget(self._clear_all_btn)
         toolbar.addWidget(self._diff_btn)
-        toolbar.addWidget(self._polish_btn)
         toolbar.addStretch(1)
 
         # --- always-on Custom prompt row -----------------------------------
@@ -1062,11 +1054,10 @@ class StudioWindow(QWidget):
     # --- transform (Phase 1 temporary slice) -------------------------------
 
     def _start_transform(self, placeholder: str, show_diff: bool = True):
-        """Common pre-transform setup shared by Polish and Custom: reveal the
-        result pane, lock it, show a placeholder, refresh button states. The
-        worker thread + signal plumbing is per-transform. `show_diff` is
-        latched here so the live diff respects translate-style presets across
-        the worker's async boundary (Preset.show_diff = False)."""
+        """Pre-transform setup for the Custom run: reveal the result pane,
+        lock it, show a placeholder, refresh button states. The worker thread +
+        signal plumbing is per-transform. `show_diff` is latched here so the
+        live diff survives the worker's async boundary."""
         self._transforming = True
         self._last_show_diff = show_diff
         if self.bottom.isHidden():
@@ -1076,26 +1067,6 @@ class StudioWindow(QWidget):
         self.bottom.editor.setReadOnly(True)
         self.bottom.controller.show_placeholder(placeholder)
         self._refresh()
-
-    def _run_polish(self):
-        """Run the hardcoded Polish preset over the whole top pane → bottom.
-        Blocking, so it runs on a worker thread; the result comes back via
-        _transform_done on the main thread."""
-        text = self.top.editor.toPlainText().strip()
-        if not text or self._transforming:
-            return
-        self._start_transform("Polishing…", show_diff=studio_llm.POLISH.show_diff)
-        threading.Thread(
-            target=self._polish_worker, args=(text,), daemon=True
-        ).start()
-
-    def _polish_worker(self, text: str):
-        try:
-            out = studio_llm.transform(text, studio_llm.POLISH)
-            self._transform_done.emit(out)
-        except Exception as e:
-            log.exception("Studio Polish failed")
-            self._transform_failed.emit(str(e))
 
     def _run_custom(self):
         """Apply the Custom instruction (free-form prompt) to the top pane.
@@ -1371,18 +1342,8 @@ class StudioWindow(QWidget):
         # revert to the action description.
         model_ready = studio_llm.is_loaded()
         loading_tip = "Loading Studio model…"
-        # Polish runs the top pane; disabled while empty, mid-transform, or
-        # mid-load.
-        self._polish_btn.setEnabled(
-            bool(self.top.editor.toPlainText())
-            and not self._transforming
-            and model_ready)
-        self._polish_btn.setToolTip(
-            loading_tip if not model_ready
-            else "Polish — rewrite the text above (LLM) into the pane below"
-        )
-        # Apply (Custom) needs BOTH a source text and a typed instruction.
-        # While transforming, lock it like Polish.
+        # Apply (Custom) needs BOTH a source text and a typed instruction;
+        # it also locks while the model loads or a transform is running.
         self._apply_btn.setEnabled(
             bool(self.top.editor.toPlainText())
             and bool(self._custom_input.toPlainText().strip())
