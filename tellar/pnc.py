@@ -38,9 +38,12 @@ _NULL = "<NULL>"
 _ACRONYM = "<ACRONYM>"
 _OVERLAP = 16
 
-# Model files: the app's model dir (first-run download target) first, then the
-# HF cache (dev / already-downloaded).
-_APP_MODELS = os.path.expanduser("~/Library/Application Support/Tellar/models")
+# The P&C model ships INSIDE the bundle (tellar/assets/pnc/): every multi-chunk
+# dictation uses it, so every user needs it; and it is NOT on HuggingFace (we
+# quantized the int8 locally), so bundling beats self-hosting + a download path.
+# Dev falls back to the HF cache. (gemma/whisper stay download-on-demand — those
+# are opt-in / huge and already on HF.)
+_BUNDLED = os.path.join(os.path.dirname(__file__), "assets", "pnc")
 _HF_CACHE = os.path.expanduser("~/.cache/huggingface")
 
 _sp = None
@@ -53,7 +56,7 @@ _TERMS = ".?!"
 
 
 def _find(*names):
-    for root in (_APP_MODELS, _HF_CACHE):
+    for root in (_BUNDLED, _HF_CACHE):
         for name in names:
             hits = glob.glob(os.path.join(root, "**", name), recursive=True)
             if hits:
@@ -69,7 +72,8 @@ def _load():
     onnx = _find("model.int8.onnx", "model.onnx")
     spe = _find("sp.model")
     if not onnx or not spe:
-        raise FileNotFoundError("P&C model files not found (model.onnx / sp.model)")
+        raise FileNotFoundError(
+            "P&C model not found (bundle tellar/assets/pnc or HF cache)")
     _sp = SentencePieceProcessor(spe)
     _sess = ort.InferenceSession(onnx, providers=["CPUExecutionProvider"])
     log.info("P&C: loaded torch-free (%s)", os.path.basename(onnx))

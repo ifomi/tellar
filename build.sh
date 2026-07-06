@@ -69,6 +69,28 @@ cp -R "$ROOT/tellar" "$APP_DIR/tellar"
 find "$APP_DIR/tellar" -name "__pycache__" -type d -prune -exec rm -rf {} +
 find "$APP_DIR/tellar" -name "*.pyc" -delete
 
+# Bundle the P&C model (int8, ~266 MB) inside the package. Every multi-chunk
+# dictation uses it and it is NOT on HuggingFace (locally quantized), so we
+# ship it rather than host + download. Sourced from the build machine's HF cache.
+echo "==> Bundling P&C model"
+PNC_ONNX="$(find "$HOME/.cache/huggingface" -name model.int8.onnx -path '*xlm-roberta_punct*' 2>/dev/null | head -1)"
+PNC_SP="$(find "$HOME/.cache/huggingface" -name sp.model -path '*xlm-roberta_punct*' 2>/dev/null | head -1)"
+if [ -z "$PNC_ONNX" ] || [ -z "$PNC_SP" ]; then
+    echo "    ERROR: P&C model not in HF cache (model.int8.onnx / sp.model)."
+    echo "    Quantize it first: tools/pnc_quantize_test.py"
+    exit 1
+fi
+mkdir -p "$APP_DIR/tellar/assets/pnc"
+cp "$PNC_ONNX" "$PNC_SP" "$APP_DIR/tellar/assets/pnc/"
+echo "    bundled P&C model ($(du -h "$PNC_ONNX" | cut -f1))"
+
+# Release safety: force DIAGNOSTIC_MODE off in the SHIPPED copy (source stays
+# True for dev) — never ship a build that logs transcripts or shows the dev UI.
+sed -i '' 's/^DIAGNOSTIC_MODE = True/DIAGNOSTIC_MODE = False/' "$APP_DIR/tellar/app.py"
+grep -q '^DIAGNOSTIC_MODE = False' "$APP_DIR/tellar/app.py" \
+    && echo "    DIAGNOSTIC_MODE forced off in bundle" \
+    || { echo "    ERROR: failed to disable DIAGNOSTIC_MODE"; exit 1; }
+
 # --- 4b. Copy app icon ---
 # Info.plist references CFBundleIconFile=icon, so macOS expects icon.icns
 # in Resources/. The pre-built .icns lives in assets/ (regenerable from
@@ -88,7 +110,10 @@ PIP_INDEX="https://pypi.apple.com/simple/"
 "$EMBEDDED_PY" -m pip install --index-url "$PIP_INDEX" --upgrade pip wheel
 "$EMBEDDED_PY" -m pip install --index-url "$PIP_INDEX" --target "$SITE" \
     "mlx-whisper==0.4.3" \
-    "mlx==0.29.3" \
+    "mlx==0.31.2" \
+    "mlx-lm==0.31.3" \
+    "transformers==5.9.0" \
+    "sentencepiece==0.2.1" \
     "numpy<2.1" \
     "huggingface-hub>=0.20" \
     "PyQt6>=6.6" \
