@@ -1,136 +1,193 @@
-"""Punctuation & Capitalization layer — variant C (full-replacement).
+"""Punctuation & Capitalization layer — seam-local, torch-free.
 
-After chunks are stitched, whisper's per-chunk formatting carries seam defects
-(false mid-sentence capitals, missing/extra periods, because each chunk is
-formatted in isolation). This layer DISCARDS that formatting and re-derives
-punctuation + case coherently over the WHOLE text with a trained P&C model, so
-seam inconsistencies cannot exist by construction.
+Runs the P&C ONNX model DIRECTLY on onnxruntime + sentencepiece (+ numpy) — NO
+torch, NO `punctuators` package — so it ships in the bundle, which deliberately
+has no torch. This reimplements what `punctuators.PunctCapSegModelONNX` does
+(sentencepiece tokenize → window ≤256 tok with overlap → ONNX run → decode the
+pre/post/cap heads into text); verified against it in tools/pnc_decode_probe.py.
 
-DEV build only: the model is loaded via the `punctuators` wrapper, which pulls
-torch as a dependency. That is fine inside the venv but must NOT go into the
-bundle — the production path will reimplement the ONNX + sentencepiece inference
-without torch/punctuators.
+Model: 1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase, int8 quantized.
 
-Model: 1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase, int8 quantized
-(spike verdict 2026-07-03: ONNX/onnxruntime, ~266 MB, keeps words intact,
-lowers wrong mid-sentence capitals; see Obsidian/Tellar/PnC Layer — предложение).
+Architecture: SEAM-LOCAL — we do not reformat the whole transcript (that damages
+text whisper already got right). For each chunk boundary we run the model on a
+small lowercased window and apply only the terminator + first-letter-case
+decision, keeping chunk interiors verbatim. No whitelist, language-agnostic.
 
-Safety contract: apply_pnc() NEVER changes the words themselves (guarded) and
-NEVER raises into the caller — on any failure it returns the input unchanged,
-so a dictation is never lost to a P&C problem.
+Safety: never raises into the caller and never changes the words themselves
+(word-integrity guard) — on any failure it returns the input unchanged, so a
+dictation is never lost to a P&C problem.
 """
 import glob
 import os
 import re
 import threading
 
-# The model is already cached (~/.cache/huggingface). Force offline at load:
-# Apple corp net 403s HF, and we must not risk a network hang on the finalize
-# path. Set before importing anything that touches huggingface_hub.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+import numpy as np
 
 from .logging_setup import get_logger
 
 log = get_logger(__name__)
 
-_MODEL_ID = "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase"
-_model = None
+# Label space + window size are FIXED for this model (from its config.yaml).
+# Hardcoded so the bundle depends on neither pyyaml nor a shipped config.yaml.
+_MAX_LEN = 256
+_PRE_LABELS = ["<NULL>", "¿"]
+_POST_LABELS = ["<NULL>", "<ACRONYM>", ".", ",", "?", "？", "，", "。", "、",
+                "・", "।", "؟", "،", ";", "።", "፣", "፧"]
+_NULL = "<NULL>"
+_ACRONYM = "<ACRONYM>"
+_OVERLAP = 16
+
+# Model files: the app's model dir (first-run download target) first, then the
+# HF cache (dev / already-downloaded).
+_APP_MODELS = os.path.expanduser("~/Library/Application Support/Tellar/models")
+_HF_CACHE = os.path.expanduser("~/.cache/huggingface")
+
+_sp = None
+_sess = None
 _lock = threading.Lock()
 
 _STRIP = re.compile(r"[^\w\s]", flags=re.UNICODE)
+_TAIL_WORDS, _HEAD_WORDS = 10, 6
+_TERMS = ".?!"
 
 
-def _int8_path():
-    """The quantized model produced during the spike, if present."""
-    hits = glob.glob(
-        os.path.expanduser("~/.cache/huggingface/**/model.int8.onnx"), recursive=True
-    )
-    return hits[0] if hits else None
+def _find(*names):
+    for root in (_APP_MODELS, _HF_CACHE):
+        for name in names:
+            hits = glob.glob(os.path.join(root, "**", name), recursive=True)
+            if hits:
+                return hits[0]
+    return None
 
 
 def _load():
-    from punctuators.models import PunctCapSegModelONNX
+    global _sp, _sess
     import onnxruntime as ort
+    from sentencepiece import SentencePieceProcessor
 
-    m = PunctCapSegModelONNX.from_pretrained(_MODEL_ID)
-    # Swap the fp32 ONNX session for the int8 one (4x smaller, ~same quality,
-    # slightly faster) when the quantized file exists.
-    int8 = _int8_path()
-    if int8:
-        m._ort_session = ort.InferenceSession(int8, providers=["CPUExecutionProvider"])
-        log.info("P&C: loaded int8 model (%s)", int8)
-    else:
-        log.info("P&C: loaded fp32 model (int8 file not found)")
-    return m
+    onnx = _find("model.int8.onnx", "model.onnx")
+    spe = _find("sp.model")
+    if not onnx or not spe:
+        raise FileNotFoundError("P&C model files not found (model.onnx / sp.model)")
+    _sp = SentencePieceProcessor(spe)
+    _sess = ort.InferenceSession(onnx, providers=["CPUExecutionProvider"])
+    log.info("P&C: loaded torch-free (%s)", os.path.basename(onnx))
 
 
-def _get():
-    global _model
-    if _model is None:
+def _ready():
+    global _sp, _sess
+    if _sp is None or _sess is None:
         with _lock:
-            if _model is None:
-                _model = _load()
-    return _model
+            if _sp is None or _sess is None:
+                _load()
 
 
 def warm():
-    """Load the model off the critical path — call in a daemon thread at
-    startup so the first multi-chunk finalize does not stall a few seconds."""
+    """Load the model off the critical path (daemon thread at startup)."""
     try:
-        _get()
+        _ready()
         log.info("P&C: model warmed")
     except Exception:
         log.exception("P&C: warm-up failed (will retry lazily on first use)")
 
 
+def _windows(ids):
+    """Split token ids into ≤(_MAX_LEN-2) windows with _OVERLAP carry, matching
+    punctuators' TextInferenceDataset so window seams behave identically."""
+    ml = _MAX_LEN - 2
+    segs, start, idx = [], 0, 0
+    while start < len(ids):
+        adj = start - (0 if idx == 0 else _OVERLAP)
+        segs.append(ids[adj:adj + ml])
+        start = adj + ml
+        idx += 1
+    return segs
+
+
+def _infer(text):
+    """Punctuate + truecase `text` via the ONNX model. Torch-free."""
+    _ready()
+    ids = _sp.EncodeAsIds(text)
+    if not ids:
+        return text
+    segs = _windows(ids)
+    bos, eos = _sp.bos_id(), _sp.eos_id()
+    m_ids, m_pre, m_post, m_cap = [], [], [], []
+    for i, seg in enumerate(segs):
+        arr = np.array([[bos] + seg + [eos]], dtype=np.int64)
+        pre, post, cap, _seg = _sess.run(None, {"input_ids": arr})
+        sl = slice(1, arr.shape[1] - 1)          # drop BOS/EOS
+        pre_t = [None if _PRE_LABELS[x] == _NULL else _PRE_LABELS[x]
+                 for x in pre[0][sl].tolist()]
+        post_t = [None if _POST_LABELS[x] == _NULL else _POST_LABELS[x]
+                  for x in post[0][sl].tolist()]
+        cap_t = cap[0][sl].tolist()
+        # Drop half the overlap on inner window edges (collector semantics).
+        start = _OVERLAP // 2 if i > 0 else 0
+        stop = len(seg) - (_OVERLAP // 2 if i < len(segs) - 1 else 0)
+        m_ids += seg[start:stop]
+        m_pre += pre_t[start:stop]
+        m_post += post_t[start:stop]
+        m_cap += cap_t[start:stop]
+    return _render(m_ids, m_pre, m_post, m_cap)
+
+
+def _render(ids, pre, post, cap):
+    pieces = [_sp.IdToPiece(x) for x in ids]
+    chars = []
+    for ti, tok in enumerate(pieces):
+        if tok.startswith("▁") and chars:
+            chars.append(" ")
+        cs = 1 if tok.startswith("▁") else 0
+        for ci, ch in enumerate(tok[cs:], start=cs):
+            if ci == cs and pre[ti]:
+                chars.append(pre[ti])
+            if ci < len(cap[ti]) and cap[ti][ci]:
+                ch = ch.upper()
+            chars.append(ch)
+            lab = post[ti]
+            if lab == _ACRONYM:
+                chars.append(".")
+            elif ci == len(tok) - 1 and lab:
+                chars.append(lab)
+    return "".join(chars).strip()
+
+
 def _lower_strip(text):
-    """Variant C input: drop punctuation, lowercase → clean slate for the model."""
+    """Variant-C input: drop punctuation, lowercase → clean slate for the model."""
     return _STRIP.sub(" ", text).lower()
 
 
 def _word_multiset(text):
-    """Case/punct-insensitive sorted word list — for the word-integrity guard."""
     return sorted(_STRIP.sub(" ", text).lower().split())
 
 
 def apply_pnc(text):
-    """Re-punctuate and re-case `text` coherently. Returns the input unchanged
-    on any failure or if the model would have altered the words themselves."""
+    """Re-punctuate and re-case `text`. Returns the input unchanged on any
+    failure or if the model would have altered the words themselves."""
     if not text or not text.strip():
         return text
     try:
-        model = _get()
-        out = model.infer([_lower_strip(text)])
-        if not out or not isinstance(out[0], list):
+        out = _infer(_lower_strip(text)).strip()
+        if not out:
             return text
-        result = " ".join(out[0]).strip()
-        if not result:
-            return text
-        # Guard: P&C may only add punctuation/case, never add/drop/alter words.
-        if _word_multiset(result) != _word_multiset(text):
+        if _word_multiset(out) != _word_multiset(text):
             log.warning("P&C word-integrity mismatch — keeping raw text")
             return text
-        return result
+        return out
     except Exception:
         log.exception("P&C failed — keeping raw text")
         return text
 
 
 # --- Seam-local P&C -------------------------------------------------------
-# Instead of reformatting the whole transcript (which damages the ~90% of text
-# whisper already punctuated correctly INSIDE each chunk), fix ONLY the chunk
-# boundaries. For each seam we ask the model, on a small lowercased window
-# (tail of chunk A + head of chunk B), two things:
-#   1. the casing of chunk B's first word in the model's output — so proper
-#      nouns (Python, Tellar) stay capitalised because the MODEL decided so,
-#      not a word list; a false sentence-cap (Перестали, Наш) gets lowered;
-#   2. whether the model placed a terminator (. ? !) at the junction.
-# We then set only chunk A's trailing punctuation and chunk B's first-letter
-# case; every chunk interior stays exactly as whisper wrote it. No whitelist,
-# language-agnostic, and the tiny windows never hit the 256-token limit.
-_TAIL_WORDS, _HEAD_WORDS = 10, 6
-_TERMS = ".?!"
+# Fix ONLY chunk boundaries. Per seam, run the model on a small lowercased
+# window (tail of chunk A + head of chunk B) and read two things: the casing
+# of chunk B's first word (so proper nouns stay capital because the MODEL
+# decided, not a list) and whether a terminator was placed at the junction.
+# We set only chunk A's trailing punctuation and chunk B's first-letter case;
+# every chunk interior stays exactly as whisper wrote it.
 
 
 def _set_first_letter(s, upper):
@@ -160,8 +217,8 @@ def _seam_decision(chunk_a, chunk_b):
 
 
 def apply_seam_local(chunks):
-    """Join `chunks` fixing only the boundaries (see block comment above).
-    Never raises — falls back to a plain join on any error."""
+    """Join `chunks` fixing only the boundaries. Never raises — falls back to a
+    plain join on any error."""
     parts = [c for c in chunks if c and c.strip()]
     if len(parts) < 2:
         return " ".join(parts)
