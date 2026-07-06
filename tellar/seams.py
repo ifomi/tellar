@@ -3,8 +3,8 @@
 When the VAD cuts mid-sentence (an intra-thought pause), the two chunks
 straddling the cut are transcribed somewhat independently. Whisper's
 decisions at the seam can disagree with the fact that it is ONE
-continuous sentence, producing three defect classes that the naive
-`" ".join` leaves in the final text:
+continuous sentence. This module fixes the two CHEAP, language-agnostic
+defect classes that the naive `" ".join` leaves behind:
 
   TERM — chunk N ends with a sentence terminator (.!?) it invented from
          the acoustic fade, while chunk N+1 — seeing N's tail as rolling
@@ -16,18 +16,15 @@ continuous sentence, producing three defect classes that the naive
          onset): "...происходит Происходит транскрибация".
          Fix: drop the duplicated leading word of N+1.
 
-  CAP  — chunk N did NOT terminate, yet chunk N+1 starts Capitalized,
-         rendering a mid-sentence pause as a false sentence break — the
-         "рваность" users report: "...чтобы Супруга...".
-         Fix: lowercase N+1's first letter, but ONLY when the word is a
-         common Russian non-name word (in the _COMMON_RU whitelist). A
-         name/place/term ("Елена", "Стоктон", "Масло", "Python") is left
-         capitalized — we never lowercase an unknown word, because a
-         seam can legitimately fall right before a proper noun.
+Seam CASING (a chunk starting with a false capital mid-sentence) is NO
+longer handled here. A whitelist of "safe to lowercase" words cannot tell
+a name from a sentence-start and does not scale to multiple languages;
+that decision now lives in the seam-local P&C pass
+(tellar/pnc.apply_seam_local), which lets the model decide per seam.
 
-This module is dependency-light on purpose (only `re` + the vocabulary
-reader) so both pipeline.finalize() and the offline replay/validation
-tools can import and apply the exact same reconciliation.
+This module is dependency-light on purpose (only `re`) so both
+pipeline.finalize() and the offline replay/validation tools can import
+and apply the exact same TERM/DUP reconciliation.
 """
 
 import re
@@ -39,51 +36,9 @@ from typing import List, Optional, Set
 _WORD = r"[^\W\d_]+(?:-[^\W\d_]+)*"
 _FIRST_WORD_RE = re.compile(r"[\W\d_]*(" + _WORD + r")")
 _WORD_RE = re.compile(_WORD)
-_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 _TERMINATORS = ".!?"
 # Separators left dangling after a removed leading duplicate word.
 _DANGLING = " \t,.;:!?—–-"
-
-# Closed whitelist of common Russian words that are NEVER proper nouns —
-# prepositions, conjunctions, pronouns/determiners (with their frequent
-# inflections), particles, discourse markers, quantifiers and auxiliary
-# verbs. The CAP fix lowercases a capitalized seam-initial word ONLY if
-# its lowercase form is in this set. This is a WHITELIST by design: an
-# unknown word (a name like "Елена", a place like "Стоктон", a term like
-# "Масло") is left capitalized rather than risk lowercasing a proper
-# noun. The cost is that some genuine common words missing from the list
-# keep a spurious capital — a minor cosmetic miss, far safer than
-# mangling a name. Grow the list from telemetry as misses surface.
-_COMMON_RU = frozenset("""
-и а но или либо да что чтобы как когда если пока потому поэтому хотя тоже
-также ведь зато причем причём итак значит следовательно иначе словно будто
-точно чем нежели раз коли дабы тем
-в во на над под с со к ко по при для от ото до из изо за о об обо про без
-безо через сквозь между меж перед передо около возле после у вокруг кроме
-вместо насчет насчёт благодаря согласно среди средь вдоль мимо ради против
-напротив внутри снаружи поверх вне
-я ты он она оно они мы вы меня тебя его её ее нас вас их мне тебе ему ей нам
-вам им мной тобой нами вами ними нем нём ней них него нее неё нему
-это этот эта эти этого этой этих этом этим эту тот та те то того той тех том
-тем ту такой такая такое такие такого таких таком таким
-который которая которое которые которого которой которых котором которым
-кто чей чья чьё чьи весь вся всё все всего всей всех всем всеми
-сам сама само сами самого самой самих себя себе собой свой своя своё свои
-своего своей своих мой моя моё мои моего твой твоя твоё наш наша наше наши
-нашего ваш ваша ваше ваши каждый каждая каждое каждые каждого любой любая
-любое любые всякий иной иная другой другая другое другие некоторый некоторые
-никто ничто ничего никого что-то кто-то что-нибудь кто-нибудь чего кого кому
-чему нечто некто
-ну вот же ли бы не ни разве неужели именно даже лишь только уже ещё еще
-вообще например скажем видимо кажется конечно наверное наверно возможно
-допустим короче типа кстати впрочем действительно собственно как-то
-как-нибудь так там тут здесь тогда теперь сейчас потом затем сначала опять
-снова вернее точнее почему зачем почти совсем очень более менее можно нужно
-надо нельзя давай давайте пусть пускай наконец ладно хорошо окей
-несколько много мало немного столько сколько больше меньше чуть примерно
-приблизительно
-есть был была было были будет будут будем буду будешь будете быть нет
-""".split())
 
 # Minimum word length for the DUP check — short function words ("и",
 # "а", "в", "по") legitimately repeat across a pause ("...по по-моему")
@@ -110,39 +65,14 @@ def _strip_leading_word(s: str) -> str:
     return s[m.end():].lstrip(_DANGLING)
 
 
-def _lower_first_letter(s: str) -> str:
-    for i, ch in enumerate(s):
-        if ch.isalpha():
-            return s[:i] + ch.lower() + s[i + 1:]
-    return s
-
-
-def _is_false_capital(word: str, vocab: Set[str]) -> bool:
-    """True if `word` is a capitalized seam-initial word that is safe to
-    lowercase as a sentence continuation. WHITELIST semantics — only common
-    Russian non-name words qualify:
-      - title-case only (first upper, rest lower or single letter) — never
-        touch ALL-CAPS acronyms ("УЗИ");
-      - lowercase form is in the closed common-word set (_COMMON_RU) — a
-        name/place/term is NOT in it, so it stays capitalized;
-      - never lowercase a word the user put in their vocabulary.
-    """
-    if not word or not word[0].isupper():
-        return False
-    if len(word) > 1 and not word[1:].islower():
-        return False
-    lw = word.lower()
-    if lw in vocab:
-        return False
-    return lw in _COMMON_RU
-
-
 def reconcile_seams(ordered: List[str], vocab: Optional[Set[str]] = None) -> List[str]:
-    """Reconcile chunk-boundary inconsistencies in a list of per-chunk
+    """Reconcile chunk-boundary defects (TERM + DUP) in a list of per-chunk
     texts. Returns a NEW list (does not mutate the input). Apply before
     joining with single spaces.
+
+    `vocab` is accepted for backward compatibility with the diagnostic tools
+    but is no longer used — seam casing is decided by the seam-local P&C pass.
     """
-    vocab = vocab or set()
     out = list(ordered)
     for i in range(len(out) - 1):
         prev, curr = out[i], out[i + 1]
@@ -169,11 +99,11 @@ def reconcile_seams(ordered: List[str], vocab: Optional[Set[str]] = None) -> Lis
                 out[i + 1] = curr_s
                 continue
 
-        # TERM / CAP — reconcile the casing across the seam.
+        # TERM — drop a spurious terminator when the next chunk continues in
+        # lowercase (N+1 has more context; trust the continuation). A false
+        # capital at the seam is handled downstream by seam-local P&C, not here.
         if prev_terminated and curr_s[0].islower():
             prev_s = prev_s[:-1].rstrip()
-        elif not prev_terminated and _is_false_capital(curr_first, vocab):
-            curr_s = _lower_first_letter(curr_s)
 
         out[i] = prev_s
         out[i + 1] = curr_s
@@ -182,8 +112,9 @@ def reconcile_seams(ordered: List[str], vocab: Optional[Set[str]] = None) -> Lis
 
 def vocabulary_word_set() -> Set[str]:
     """Lowercased set of individual words across all vocabulary entries
-    (multi-word phrases are split). Used to protect proper nouns from the
-    CAP lowercasing. Never raises — empty set on any error."""
+    (multi-word phrases are split). Retained for the diagnostic tools
+    (tools/scan_defects.py); no longer used by reconcile_seams. Never
+    raises — empty set on any error."""
     try:
         from .vocabulary import read_vocabulary
         words: Set[str] = set()

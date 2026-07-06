@@ -60,7 +60,7 @@ from . import pnc
 from .chunking import ChunkingBuffer, TARGET_RATE
 from .hallucinations import remove_hallucinations
 from .recorder import Recorder
-from .seams import reconcile_seams, vocabulary_word_set
+from .seams import reconcile_seams
 from .transcriber import transcribe_audio_defaults, transcribe_chunk, clean_hallucinations
 from .logging_setup import get_logger
 
@@ -291,11 +291,12 @@ class TranscriptionPipeline:
                 )
             else:
                 ordered = [self._results[i] for i in range(self._chunk_idx)]
-                # Reconcile chunk-boundary inconsistencies before joining:
-                # spurious terminators, words duplicated across a seam, and
-                # false capitals where a mid-sentence pause was rendered as
-                # a new sentence. See tellar/seams.py for the full rationale.
-                ordered = reconcile_seams(ordered, vocabulary_word_set())
+                # Reconcile cheap chunk-boundary defects before joining:
+                # spurious terminators (TERM) and words duplicated across a
+                # seam (DUP). Seam CASING is now decided by the seam-local P&C
+                # pass below (a whitelist can't scale to multiple languages),
+                # so reconcile_seams no longer touches capitals.
+                ordered = reconcile_seams(ordered)
                 if DEBUG_CHUNK_MARKERS:
                     parts: List[str] = []
                     for i, text in enumerate(ordered):
@@ -314,20 +315,20 @@ class TranscriptionPipeline:
                             )
                             parts.append(f"⟨✂{i}: {duration:.2f}s {reason}⟩")
                     joined = " ".join(parts)
+                elif PNC_ENABLED and self._chunk_idx > 1:
+                    # Seam-local P&C: fix ONLY the chunk boundaries (terminator
+                    # + first-letter case of the next chunk), decided by the
+                    # model on a small lowercased window. Chunk interiors stay
+                    # exactly as whisper wrote them — no reformatting of already
+                    # correct text, no whitelist, language-agnostic.
+                    joined = pnc.apply_seam_local(ordered)
+                    self._pnc_applied = True
                 else:
                     joined = " ".join(part for part in ordered if part)
                 log.info("Pipeline finalize: assembled from %d chunks (%d chars)",
                          self._chunk_idx, len(joined))
                 self._finalize_path = "assembled"
-                result = remove_hallucinations(clean_hallucinations(joined))
-                # P&C layer (variant C): re-derive punctuation/case over the
-                # whole text so per-chunk seam formatting cannot survive.
-                # Gated to multi-chunk (single chunk has no seams) and skipped
-                # under DEBUG_CHUNK_MARKERS (the ⟨✂⟩ markers would confuse it).
-                if PNC_ENABLED and not DEBUG_CHUNK_MARKERS and self._chunk_idx > 1:
-                    result = pnc.apply_pnc(result)
-                    self._pnc_applied = True
-                return result
+                return remove_hallucinations(clean_hallucinations(joined))
 
         log.info("Pipeline finalize: using fallback transcribe_audio_defaults")
         self._last_fallback_used = True

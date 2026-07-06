@@ -115,3 +115,65 @@ def apply_pnc(text):
     except Exception:
         log.exception("P&C failed — keeping raw text")
         return text
+
+
+# --- Seam-local P&C -------------------------------------------------------
+# Instead of reformatting the whole transcript (which damages the ~90% of text
+# whisper already punctuated correctly INSIDE each chunk), fix ONLY the chunk
+# boundaries. For each seam we ask the model, on a small lowercased window
+# (tail of chunk A + head of chunk B), two things:
+#   1. the casing of chunk B's first word in the model's output — so proper
+#      nouns (Python, Tellar) stay capitalised because the MODEL decided so,
+#      not a word list; a false sentence-cap (Перестали, Наш) gets lowered;
+#   2. whether the model placed a terminator (. ? !) at the junction.
+# We then set only chunk A's trailing punctuation and chunk B's first-letter
+# case; every chunk interior stays exactly as whisper wrote it. No whitelist,
+# language-agnostic, and the tiny windows never hit the 256-token limit.
+_TAIL_WORDS, _HEAD_WORDS = 10, 6
+_TERMS = ".?!"
+
+
+def _set_first_letter(s, upper):
+    for i, ch in enumerate(s):
+        if ch.isalpha():
+            return s[:i] + (ch.upper() if upper else ch.lower()) + s[i + 1:]
+    return s
+
+
+def _seam_decision(chunk_a, chunk_b):
+    """(cap_b, term_char_or_None) for the A→B boundary, or (None, None) if the
+    model output could not be aligned to the window (then leave the seam as-is)."""
+    a = _lower_strip(chunk_a).split()[-_TAIL_WORDS:]
+    b = _lower_strip(chunk_b).split()[:_HEAD_WORDS]
+    if not a or not b:
+        return None, None
+    out = apply_pnc(" ".join(a + b))
+    words = out.split()
+    j = len(a)
+    if len(words) != len(a) + len(b) or j >= len(words) or j == 0:
+        return None, None
+    b_first = words[j]
+    cap_b = next((c.isupper() for c in b_first if c.isalpha()), False)
+    prev = words[j - 1]
+    term = prev[-1] if prev and prev[-1] in _TERMS else None
+    return cap_b, term
+
+
+def apply_seam_local(chunks):
+    """Join `chunks` fixing only the boundaries (see block comment above).
+    Never raises — falls back to a plain join on any error."""
+    parts = [c for c in chunks if c and c.strip()]
+    if len(parts) < 2:
+        return " ".join(parts)
+    try:
+        out = list(parts)
+        for i in range(len(out) - 1):
+            cap_b, term = _seam_decision(out[i], out[i + 1])
+            if cap_b is None:
+                continue  # undecided → leave this seam untouched
+            out[i] = out[i].rstrip().rstrip(".,;:!? ") + (term or "")
+            out[i + 1] = _set_first_letter(out[i + 1].lstrip(), cap_b)
+        return " ".join(out)
+    except Exception:
+        log.exception("seam-local P&C failed — plain join")
+        return " ".join(parts)
